@@ -920,11 +920,44 @@ Stop the writer thread on application shutdown (waits for pending writes):
 Read queries work as normal. Open and close the connection per-request as you
 would with any other database. Only writes are funneled through the queue.
 
-**Transactions are not supported.** Because writes from different threads
-are interleaved, there is no way to guarantee that the statements in a
-transaction from one thread execute atomically without statements from
-another thread appearing between them. The ``atomic()`` and
-``transaction()`` methods raise a ``ValueError`` if called.
+**Transactions require** :meth:`~SqliteQueueDatabase.execute_transaction`.
+Because writes from different threads are interleaved on the writer thread,
+an ordinary ``atomic()`` block cannot guarantee that its statements execute
+atomically. Calling ``atomic()``, ``transaction()`` or ``savepoint()``
+directly therefore raises a ``ValueError``. Instead, hand a callable to
+:meth:`~SqliteQueueDatabase.execute_transaction`, which runs it on the
+writer thread as an indivisible unit:
+
+.. code-block:: python
+
+   def transfer(from_acct, to_acct, amount):
+       # Runs on the writer thread, inside a transaction. Reads here see
+       # this unit's own not-yet-committed writes.
+       from_acct.balance -= amount
+       to_acct.balance += amount
+       from_acct.save()
+       to_acct.save()
+       return from_acct.balance
+
+   # Blocks until the unit commits, then returns the callback's value.
+   new_balance = db.execute_transaction(
+       lambda: transfer(acct_a, acct_b, 100), timeout=5.0)
+
+Transaction units and ordinary queued writes are executed by the writer
+strictly in the order they were submitted, so no other writes can interleave
+with the callback's statements. If the callback raises, or the commit fails,
+the transaction is rolled back and the original exception is re-raised in
+the calling thread; the writer thread remains usable for subsequent work.
+
+Inside the callback, ``atomic()`` and ``savepoint()`` are available and are
+implemented as savepoints. Calling ``execute_transaction()`` recursively
+from within a callback raises a ``ValueError``.
+
+.. note::
+   The ``timeout`` parameter only limits how long the *calling* thread
+   blocks waiting for the result (raising ``ResultTimeout``). Once the
+   writer has begun executing a callback it always runs to completion --
+   it is never interrupted, killed or retried, regardless of the timeout.
 
 To write directly, bypassing the queue (for example, a bulk import through
 a separate connection), use :meth:`~SqliteQueueDatabase.pause` and
@@ -964,6 +997,30 @@ disconnected, and writes submitted through the queue raise ``WriterPaused``.
    .. method:: unpause()
 
       Resume the writer thread and reconnect the queue.
+
+   .. method:: execute_transaction(callback, timeout=None)
+
+      Execute ``callback`` on the background writer thread, inside a
+      transaction. The callback may issue ordinary Peewee queries against
+      this database; reads see the callback's own uncommitted writes, and
+      no other writes or transaction units can interleave with it.
+
+      On success the transaction is committed and the callback's return
+      value is returned to the caller. If the callback raises an exception
+      or the commit fails, the transaction is rolled back and the original
+      exception is re-raised in the calling thread; the writer thread
+      remains usable for subsequent work.
+
+      Within the callback, ``atomic()`` / ``savepoint()`` act as
+      savepoints. Recursive calls to ``execute_transaction()`` from within
+      a callback raise a ``ValueError``.
+
+      :param callable callback: function to execute on the writer thread.
+      :param float timeout: maximum time (seconds) the *calling* thread
+          waits for the result before raising ``ResultTimeout``. The
+          timeout does not interrupt, cancel or retry a callback that has
+          already started executing -- it always runs to completion.
+      :returns: the callback's return value, after the transaction commits.
 
 
 .. _sqlite-fields:
@@ -2638,4 +2695,3 @@ Available functions
    SequenceMatcher's algorithm.
 
    .. note:: Only available if you compiled the ``_sqlite_udf`` extension.
-

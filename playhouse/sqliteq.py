@@ -1,6 +1,7 @@
 import logging
 from queue import Queue
 from threading import Event
+from threading import local as ThreadLocal
 from threading import Lock
 from threading import Thread
 
@@ -8,9 +9,10 @@ try:
     import gevent
     from gevent import Greenlet as GThread
     from gevent.event import Event as GEvent
+    from gevent.local import local as GLocal
     from gevent.queue import Queue as GQueue
 except ImportError:
-    GThread = GQueue = GEvent = None
+    GThread = GQueue = GEvent = GLocal = None
 
 from peewee import SqliteDatabase
 
@@ -113,6 +115,29 @@ SHUTDOWN = StopIteration
 QUERY = object()
 PAUSE = object()
 UNPAUSE = object()
+TXN = object()
+
+
+class AsyncTransaction(object):
+    __slots__ = ('callback', '_event', '_result', '_exc')
+
+    def __init__(self, event, callback):
+        self._event = event
+        self.callback = callback
+        self._result = self._exc = None
+
+    def set_result(self, result, exc=None):
+        self._result = result
+        self._exc = exc
+        self._event.set()
+        return self
+
+    def result(self, timeout=None):
+        if not self._event.wait(timeout=timeout) and timeout is not None:
+            raise ResultTimeout('transaction result not ready, timed out.')
+        if self._exc is not None:
+            raise self._exc
+        return self._result
 
 
 class Writer(object):
@@ -159,6 +184,8 @@ class Writer(object):
         op, obj = self.queue.get()
         if op is QUERY:
             self.execute(obj)
+        elif op is TXN:
+            self.execute_transaction(obj)
         elif op is PAUSE:
             logger.info('writer paused - closing database connection.')
             self.database._close(conn)
@@ -185,6 +212,23 @@ class Writer(object):
             exc = None
         return obj.set_result(cursor, exc)
 
+    def execute_transaction(self, obj):
+        db = self.database
+        db._txn_local.in_txn = True
+        try:
+            try:
+                with db._parent_transaction():
+                    result = obj.callback()
+            except BaseException as txn_err:
+                # The transaction context-manager rolls back on error
+                # (including a failed commit). Propagate the original
+                # exception to the caller and keep the writer alive.
+                obj.set_result(None, txn_err)
+            else:
+                obj.set_result(result)
+        finally:
+            db._txn_local.in_txn = False
+
 
 class SqliteQueueDatabase(SqliteDatabase):
     WAL_MODE_ERROR_MESSAGE = ('SQLite must be configured to use the WAL '
@@ -210,6 +254,14 @@ class SqliteQueueDatabase(SqliteDatabase):
         Parent = super(SqliteQueueDatabase, self)
         self._execute = Parent.execute_sql
 
+        # References to the parent class transaction APIs. These are used to
+        # drive transactions on the writer thread and to support savepoints
+        # within execute_transaction() callbacks. They remain unavailable to
+        # ordinary calling threads (see atomic()/transaction()/savepoint()).
+        self._parent_atomic = Parent.atomic
+        self._parent_transaction = Parent.transaction
+        self._parent_savepoint = Parent.savepoint
+
         # Call the parent class constructor with our modified pragmas.
         Parent.__init__(database, pragmas=pragmas, *args, **kwargs)
 
@@ -220,13 +272,25 @@ class SqliteQueueDatabase(SqliteDatabase):
         # Get different objects depending on the threading implementation.
         self._thread_helper = self.get_thread_impl(use_gevent)(queue_max_size)
 
+        # Thread/greenlet-local flag indicating that the current thread is
+        # the writer, executing an execute_transaction() callback. Database
+        # operations issued from the callback must run directly on the
+        # writer's connection rather than being re-queued (which would
+        # deadlock the writer on itself).
+        self._txn_local = self._thread_helper.local()
+
         # Create the writer thread, optionally starting it.
         self._create_write_queue()
         if self._autostart:
             self.start()
 
     def get_thread_impl(self, use_gevent):
-        return GreenletHelper if use_gevent else ThreadHelper
+        if use_gevent:
+            if GThread is None:
+                raise ImportError('gevent is required to use '
+                                  'SqliteQueueDatabase with use_gevent=True.')
+            return GreenletHelper
+        return ThreadHelper
 
     def _validate_journal_mode(self, pragmas=None):
         if not pragmas:
@@ -247,6 +311,13 @@ class SqliteQueueDatabase(SqliteDatabase):
         return self._write_queue.qsize()
 
     def execute_sql(self, sql, params=None, timeout=None):
+        if getattr(self._txn_local, 'in_txn', False):
+            # We are on the writer thread, inside an execute_transaction()
+            # callback. Execute directly on the writer's connection so the
+            # callback sees its own uncommitted changes and does not
+            # deadlock waiting on itself.
+            return self._execute(sql, params)
+
         if sql.lower().startswith('select'):
             return self._execute(sql, params)
 
@@ -257,6 +328,41 @@ class SqliteQueueDatabase(SqliteDatabase):
             timeout=self._results_timeout if timeout is None else timeout)
         self._write_queue.put((QUERY, cursor))
         return cursor
+
+    def execute_transaction(self, callback, timeout=None):
+        """
+        Execute ``callback`` on the writer thread, inside a transaction.
+
+        The callback runs synchronously on the background writer thread and
+        may issue ordinary Peewee queries against this database. Reads from
+        within the callback see the callback's own not-yet-committed writes.
+        Transaction units and ordinary queued writes are executed by the
+        writer strictly in the order they were enqueued, so no other writes
+        can interleave with the callback's statements.
+
+        If the callback raises, or the commit fails, the transaction is
+        rolled back and the original exception is re-raised in the calling
+        thread. The writer thread remains usable for subsequent work. On
+        success, the callback's return value is returned to the caller once
+        the transaction has been committed.
+
+        Within the callback, ``atomic()`` (and ``savepoint()``) may be used
+        and are implemented as savepoints. Calling ``execute_transaction()``
+        recursively from within a callback raises a ``ValueError``.
+
+        ``timeout`` only limits how long the *calling* thread blocks waiting
+        for the result (raising ``ResultTimeout``). Once the writer has
+        begun executing the callback it always runs to completion -- it is
+        never interrupted, killed or retried, regardless of the timeout.
+        """
+        if getattr(self._txn_local, 'in_txn', False):
+            raise ValueError('execute_transaction() cannot be called from '
+                             'within a transaction callback.')
+        txn = AsyncTransaction(
+            event=self._thread_helper.event(),
+            callback=callback)
+        self._write_queue.put((TXN, txn))
+        return txn.result(timeout)
 
     def start(self):
         with self._qlock:
@@ -288,7 +394,7 @@ class SqliteQueueDatabase(SqliteDatabase):
             op, obj = self._write_queue.get()
             if op is PAUSE or op is UNPAUSE:
                 obj.set()
-            elif op is QUERY:
+            elif op is QUERY or op is TXN:
                 obj.set_result(None, ShutdownException())
 
         return True
@@ -317,9 +423,25 @@ class SqliteQueueDatabase(SqliteDatabase):
 
         evt.wait()
 
-    def __unsupported__(self, *args, **kwargs):
-        raise ValueError('This method is not supported by %r.' % type(self))
-    atomic = transaction = savepoint = __unsupported__
+    def _check_in_txn(self, method):
+        if not getattr(self._txn_local, 'in_txn', False):
+            raise ValueError(
+                '%s() is not supported by %r outside of an '
+                'execute_transaction() callback.' % (method, type(self)))
+
+    def atomic(self, *args, **kwargs):
+        # Within an execute_transaction() callback this is implemented as a
+        # savepoint (the callback already runs inside a transaction).
+        self._check_in_txn('atomic')
+        return self._parent_atomic(*args, **kwargs)
+
+    def transaction(self, *args, **kwargs):
+        self._check_in_txn('transaction')
+        return self._parent_transaction(*args, **kwargs)
+
+    def savepoint(self):
+        self._check_in_txn('savepoint')
+        return self._parent_savepoint()
 
 
 class ThreadHelper(object):
@@ -329,6 +451,8 @@ class ThreadHelper(object):
         self.queue_max_size = queue_max_size
 
     def event(self): return Event()
+
+    def local(self): return ThreadLocal()
 
     def queue(self, max_size=None):
         max_size = max_size if max_size is not None else self.queue_max_size
@@ -344,6 +468,8 @@ class GreenletHelper(ThreadHelper):
     __slots__ = ()
 
     def event(self): return GEvent()
+
+    def local(self): return GLocal()
 
     def queue(self, max_size=None):
         max_size = max_size if max_size is not None else self.queue_max_size
