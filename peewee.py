@@ -129,6 +129,7 @@ __all__ = [
     'NotSupportedError',
     'OP',
     'OperationalError',
+    'OptimisticConcurrencyError',
     'PostgresqlDatabase',
     'PrimaryKeyField',  # XXX: Deprecated, change to AutoField.
     'prefetch',
@@ -3635,6 +3636,19 @@ class InternalError(DatabaseError): pass
 class NotSupportedError(DatabaseError): pass
 class OperationalError(DatabaseError): pass
 class ProgrammingError(DatabaseError): pass
+
+
+class OptimisticConcurrencyError(PeeweeException):
+    """Raised when an optimistic bulk update detects conflicting rows."""
+    def __init__(self, model, conflicts):
+        self.model = model
+        self.conflicts = frozenset(conflicts)
+        message = ('optimistic concurrency conflict updating %s; '
+                   'conflicting primary keys: %s' % (
+                       model.__name__,
+                       ', '.join(repr(pk) for pk in
+                                 sorted(self.conflicts, key=repr))))
+        super(OptimisticConcurrencyError, self).__init__(message)
 
 
 class ExceptionWrapper(object):
@@ -7942,6 +7956,138 @@ class Model(Node, metaclass=ModelBase):
             n += (cls.update(update)
                   .where(cls._meta.primary_key.in_(id_list))
                   .execute())
+        return n
+
+    @classmethod
+    def bulk_update_optimistic(cls, model_list, fields, version_field,
+                               batch_size=None):
+        meta = cls._meta
+        pk = meta.primary_key
+        if pk is False or isinstance(pk, CompositeKey):
+            raise ValueError('bulk_update_optimistic() requires a model '
+                             'with a single-column primary key.')
+        if not isinstance(meta.database, SqliteDatabase):
+            raise NotSupportedError('bulk_update_optimistic() currently '
+                                    'requires a SQLite database.')
+
+        # Normalize and validate the version field.
+        if isinstance(version_field, str):
+            field_name = version_field
+            version_field = meta.fields.get(field_name)
+            if version_field is None:
+                raise ValueError('unknown version field: %s' % field_name)
+        if not isinstance(version_field, Field) or \
+           meta.fields.get(version_field.name) is not version_field:
+            raise ValueError('invalid version field: %r' % (version_field,))
+        if version_field is pk:
+            raise ValueError('version field cannot be the primary key.')
+        if not isinstance(version_field, IntegerField):
+            raise ValueError('version field must be an IntegerField, got '
+                             '%s.' % type(version_field).__name__)
+
+        # First normalize list of fields so all are field instances.
+        fields = [meta.fields[f] if isinstance(f, str) else f
+                  for f in fields]
+        for field in fields:
+            if field is pk:
+                raise ValueError('primary key cannot be included in the '
+                                 'list of fields to update.')
+            if field is version_field:
+                raise ValueError('version field cannot be included in the '
+                                 'list of fields to update.')
+
+        model_list = list(model_list)
+        if not model_list:
+            return 0
+        seen = set()
+        for model in model_list:
+            pk_value = model._pk
+            if pk_value is None:
+                raise ValueError('bulk_update_optimistic() cannot be used '
+                                 'with unsaved model instances.')
+            if pk_value in seen:
+                raise ValueError('duplicate primary key in model list: %r'
+                                 % (pk_value,))
+            seen.add(pk_value)
+
+        # Now collect list of attribute names to use for values.
+        attrs = [field.safe_name for field in fields]
+        version_attr = version_field.safe_name
+
+        if batch_size is not None:
+            batches = chunked(model_list, batch_size)
+        else:
+            batches = [model_list]
+
+        n = 0
+        with meta.database.atomic():
+            for batch in batches:
+                id_list = [model._pk for model in batch]
+
+                # Verify, inside the transaction, that every row still
+                # exists and that its version matches the version the
+                # instance was read with. On SQLite this read holds a lock
+                # that prevents another connection from committing changes
+                # to these rows before the UPDATE below runs.
+                current = dict(cls.select(pk, version_field)
+                               .where(pk.in_(id_list))
+                               .tuples())
+                conflicts = set()
+                for model in batch:
+                    pk_value = model._pk
+                    expected = getattr(model, version_attr)
+                    if pk_value not in current or \
+                       current[pk_value] != expected:
+                        conflicts.add(pk_value)
+                if conflicts:
+                    raise OptimisticConcurrencyError(cls, conflicts)
+
+                update = {}
+                for field, attr in zip(fields, attrs):
+                    accum = []
+                    for model in batch:
+                        value = getattr(model, attr)
+                        if not isinstance(value, Node):
+                            value = field.case_value(value)
+                        accum.append((pk.to_value(model._pk), value))
+                    update[field] = Case(pk, accum)
+                update[version_field] = version_field + 1
+
+                # Each row is only updated when the version stored in the
+                # database still matches the version the instance was read
+                # with.
+                where = None
+                for model in batch:
+                    predicate = ((pk == model._pk) &
+                                 (version_field ==
+                                  getattr(model, version_attr)))
+                    where = predicate if where is None else where | predicate
+
+                updated = cls.update(update).where(where).execute()
+                if updated != len(batch):
+                    # Should not occur once the check above has passed, but
+                    # guard against a row changing between the check and the
+                    # UPDATE. Rows updated by the statement above now have
+                    # version expected + 1.
+                    current = dict(cls.select(pk, version_field)
+                                   .where(pk.in_(id_list))
+                                   .tuples())
+                    conflicts = set()
+                    for model in batch:
+                        pk_value = model._pk
+                        expected = getattr(model, version_attr) + 1
+                        if pk_value not in current or \
+                           current[pk_value] != expected:
+                            conflicts.add(pk_value)
+                    raise OptimisticConcurrencyError(cls, conflicts)
+                n += updated
+
+        # Only update instance state once the transaction has committed.
+        saved_names = set(field.name for field in fields)
+        saved_names.add(version_field.name)
+        for model in model_list:
+            setattr(model, version_attr, getattr(model, version_attr) + 1)
+            model._dirty -= saved_names
         return n
 
     @classmethod

@@ -1853,6 +1853,211 @@ class TestModelAPIs(ModelTestCase):
             self.assertEqual(list(query), [])
 
 
+class VNote(TestModel):
+    content = CharField()
+    timestamp = DateTimeField(null=True)
+    version = IntegerField(default=0)
+
+
+@skip_unless(IS_SQLITE, 'bulk_update_optimistic requires sqlite')
+class TestBulkUpdateOptimistic(ModelTestCase):
+    requires = [VNote]
+
+    def add_notes(self, n=3):
+        for i in range(n):
+            VNote.create(content='c%s' % i)
+        return list(VNote.select().order_by(VNote.id))
+
+    def other_connection_update(self, sql, params):
+        db2 = new_connection()
+        try:
+            db2.connect()
+            db2.execute_sql(sql, params)
+        finally:
+            db2.close()
+
+    def bump_version(self, pk_value):
+        self.other_connection_update(
+            'UPDATE %s SET version = version + 1 WHERE id = ?'
+            % VNote._meta.table_name, (pk_value,))
+
+    def delete_row(self, pk_value):
+        self.other_connection_update(
+            'DELETE FROM %s WHERE id = ?' % VNote._meta.table_name,
+            (pk_value,))
+
+    def db_state(self):
+        return [(n.content, n.version) for n in
+                VNote.select().order_by(VNote.id)]
+
+    def test_bulk_update_optimistic(self):
+        notes = self.add_notes(4)
+        for note in notes:
+            note.content += '-x'
+
+        n = VNote.bulk_update_optimistic(notes, ['content'], 'version',
+                                         batch_size=2)
+        self.assertEqual(n, 4)
+
+        # Database rows were updated and their versions incremented.
+        self.assertEqual(self.db_state(), [
+            ('c0-x', 1), ('c1-x', 1), ('c2-x', 1), ('c3-x', 1)])
+
+        # Instances reflect the new version and are no longer dirty.
+        self.assertEqual([note.version for note in notes], [1, 1, 1, 1])
+        self.assertFalse(any(note.is_dirty() for note in notes))
+
+    def test_bulk_update_optimistic_empty(self):
+        with self.assertQueryCount(0):
+            n = VNote.bulk_update_optimistic([], ['content'], 'version')
+        self.assertEqual(n, 0)
+
+    def test_bulk_update_optimistic_conflict(self):
+        notes = self.add_notes(3)
+
+        # Another connection modifies the middle row first.
+        self.bump_version(notes[1].id)
+
+        for note in notes:
+            note.content += '-x'
+        with self.assertRaises(OptimisticConcurrencyError) as ctx:
+            VNote.bulk_update_optimistic(notes, ['content'], 'version')
+
+        exc = ctx.exception
+        self.assertEqual(exc.conflicts, {notes[1].id})
+        self.assertTrue(exc.model is VNote)
+
+        # Nothing was modified in the database.
+        self.assertEqual(self.db_state(), [
+            ('c0', 0), ('c1', 1), ('c2', 0)])
+
+        # Instances are left untouched so the caller can recover.
+        self.assertEqual([note.version for note in notes], [0, 0, 0])
+        self.assertEqual([note.content for note in notes],
+                         ['c0-x', 'c1-x', 'c2-x'])
+        self.assertTrue(all(note.is_dirty() for note in notes))
+
+    def test_bulk_update_optimistic_conflict_across_batches(self):
+        notes = self.add_notes(5)
+
+        # Conflict lands in the second batch (batch_size=2).
+        self.bump_version(notes[2].id)
+
+        for note in notes:
+            note.content += '-x'
+        with self.assertRaises(OptimisticConcurrencyError) as ctx:
+            VNote.bulk_update_optimistic(notes, ['content'], 'version',
+                                         batch_size=2)
+        self.assertEqual(ctx.exception.conflicts, {notes[2].id})
+
+        # The first batch was rolled back: no partial changes remain.
+        self.assertEqual(self.db_state(), [
+            ('c0', 0), ('c1', 0), ('c2', 1), ('c3', 0), ('c4', 0)])
+        self.assertEqual([note.version for note in notes], [0] * 5)
+
+    def test_bulk_update_optimistic_deleted_row(self):
+        notes = self.add_notes(3)
+        self.delete_row(notes[1].id)
+
+        for note in notes:
+            note.content += '-x'
+        with self.assertRaises(OptimisticConcurrencyError) as ctx:
+            VNote.bulk_update_optimistic(notes, ['content'], 'version')
+        self.assertEqual(ctx.exception.conflicts, {notes[1].id})
+
+        self.assertEqual(self.db_state(), [('c0', 0), ('c2', 0)])
+
+    def test_bulk_update_optimistic_apply_dbvalue(self):
+        notes = self.add_notes(3)
+        notes[0].timestamp = datetime.datetime(2019, 1, 2, 3, 4, 5)
+        notes[1].timestamp = datetime.date(2019, 1, 3)
+        notes[2].timestamp = '2012-05-15 21:01:40'
+
+        n = VNote.bulk_update_optimistic(notes, ['timestamp'], 'version')
+        self.assertEqual(n, 3)
+
+        t0, t1, t2 = [note.timestamp for note in
+                      VNote.select().order_by(VNote.id)]
+        self.assertEqual(t0, datetime.datetime(2019, 1, 2, 3, 4, 5))
+        self.assertEqual(t1, datetime.datetime(2019, 1, 3, 0, 0, 0))
+        self.assertEqual(t2, datetime.datetime(2012, 5, 15, 21, 1, 40))
+
+    def test_bulk_update_optimistic_outer_atomic(self):
+        notes = self.add_notes(3)
+        self.bump_version(notes[1].id)
+        for note in notes:
+            note.content += '-x'
+
+        with self.database.atomic():
+            marker = VNote.create(content='marker')
+
+            # The conflict rolls back to a savepoint; the outer
+            # transaction remains usable.
+            with self.assertRaises(OptimisticConcurrencyError) as ctx:
+                VNote.bulk_update_optimistic(notes, ['content'], 'version')
+            self.assertEqual(ctx.exception.conflicts, {notes[1].id})
+
+            # Retry with freshly-read instances and keep working.
+            fresh = list(VNote.select().order_by(VNote.id))
+            for note in fresh:
+                note.content += '-y'
+            n = VNote.bulk_update_optimistic(fresh, ['content'],
+                                             VNote.version)
+            self.assertEqual(n, 4)
+
+        self.assertEqual(self.db_state(), [
+            ('c0-y', 1), ('c1-y', 2), ('c2-y', 1), ('marker-y', 1)])
+
+        # The stale instances from the failed attempt were not mutated.
+        self.assertEqual([note.version for note in notes], [0, 0, 0])
+        self.assertEqual([note.content for note in notes],
+                         ['c0-x', 'c1-x', 'c2-x'])
+
+    def test_bulk_update_optimistic_validation(self):
+        note = VNote.create(content='c0')
+
+        def assert_value_error(*args):
+            self.assertRaises(ValueError,
+                              VNote.bulk_update_optimistic, *args)
+
+        # Primary key or version field cannot be updated directly.
+        assert_value_error([note], ['id'], 'version')
+        assert_value_error([note], ['version'], 'version')
+        assert_value_error([note], [VNote.id], 'version')
+        assert_value_error([note], [VNote.version], 'version')
+
+        # Invalid version fields.
+        assert_value_error([note], ['content'], 'id')  # Primary key.
+        assert_value_error([note], ['content'], 'content')  # Not an integer.
+        assert_value_error([note], ['content'], 'missing')  # Unknown field.
+        assert_value_error([note], ['content'], User.username)  # Wrong model.
+        assert_value_error([note], ['content'], None)
+
+        # Unsaved instances and duplicate primary keys.
+        assert_value_error([VNote(content='x')], ['content'], 'version')
+        assert_value_error([note, note], ['content'], 'version')
+
+        # Composite primary keys are rejected.
+        self.assertRaises(ValueError, CPK.bulk_update_optimistic,
+                          [], ['extra'], 'version')
+
+        # Normal bulk_update() behavior is unchanged.
+        note.content = 'c0-bulk'
+        n = VNote.bulk_update([note], ['content'])
+        self.assertEqual(n, 1)
+        self.assertEqual(VNote.get_by_id(note.id).content, 'c0-bulk')
+
+    def test_bulk_update_optimistic_unsupported_database(self):
+        original_db = VNote._meta.database
+        VNote._meta.set_database(MySQLDatabase('dummy'))
+        try:
+            self.assertRaises(NotSupportedError,
+                              VNote.bulk_update_optimistic,
+                              [], ['content'], 'version')
+        finally:
+            VNote._meta.set_database(original_db)
+
+
 class Site(TestModel):
     url = TextField()
 

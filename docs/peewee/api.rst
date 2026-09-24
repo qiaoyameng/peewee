@@ -1925,12 +1925,59 @@ Model
          with database.atomic():
              User.bulk_update(user_list, fields=['username'], batch_size=50)
 
-      ``bulk_update`` may be slower than a direct UPDATE query when the list is
-      very large, because the generated ``CASE`` expression grows proportionally.
-      For updates that can be expressed as a single WHERE clause, the direct
-      :meth:`~Model.update` approach is faster.
+     ``bulk_update`` may be slower than a direct UPDATE query when the list is
+     very large, because the generated ``CASE`` expression grows proportionally.
+     For updates that can be expressed as a single WHERE clause, the direct
+     :meth:`~Model.update` approach is faster.
 
-   .. classmethod:: get(*query, **filters)
+   .. classmethod:: bulk_update_optimistic(model_list, fields, version_field, batch_size=None)
+
+      :param iterable model_list: a list or other iterable of
+          :class:`Model` instances that were previously read from the
+          database.
+      :param list fields: list of fields to update.
+      :param version_field: integer field (or field name) used for optimistic
+          concurrency control.
+      :param int batch_size: number of rows to batch per query. If
+          unspecified, all models will be updated in a single batch.
+      :return: total number of rows updated.
+      :raises OptimisticConcurrencyError: if any row was deleted or its
+          version no longer matches the version the instance was read with.
+
+      Update multiple model instances like :meth:`Model.bulk_update`, but
+      each row is only modified when the ``version_field`` value stored in
+      the database still equals the version on the instance. Every updated
+      row has its version incremented by one.
+
+      The whole call runs in a transaction (even when ``batch_size`` splits
+      it into multiple queries), so a conflict never leaves partial changes
+      behind. On conflict an :py:class:`OptimisticConcurrencyError` is
+      raised whose ``conflicts`` attribute contains the set of conflicting
+      primary keys; the instances passed in are left untouched so the caller
+      can recover. On success the instances versions are incremented and
+      the updated fields are no longer marked dirty.
+
+      Example:
+
+      .. code-block:: python
+
+         users = list(User.select())
+         for user in users:
+             user.credits -= 10
+
+         try:
+             User.bulk_update_optimistic(users, ['credits'], 'version')
+         except OptimisticConcurrencyError as exc:
+             print('conflicting user ids:', exc.conflicts)
+
+      .. note::
+         Currently only supported for models with a single-column primary
+         key on SQLite. Composite primary keys, duplicate primary keys,
+         unsaved instances, a non-integer version field, and including the
+         primary key or version field in ``fields`` are all rejected with
+         an error.
+
+  .. classmethod:: get(*query, **filters)
 
       :param query: Zero or more :class:`Expression` objects.
       :param filters: Mapping of field-name to value for Django-style filter.

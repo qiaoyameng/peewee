@@ -416,6 +416,32 @@ very large, because the generated ``CASE`` expression grows proportionally.
 For updates that can be expressed as a single WHERE clause, the direct
 :meth:`~Model.update` approach is faster.
 
+Optimistic concurrency control
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If your model has an integer version field, :meth:`~Model.bulk_update_optimistic`
+performs a bulk update that only modifies a row when the version stored in
+the database still matches the version the instance was read with. Updated
+rows have their version incremented by one, and the whole call is atomic --
+even when ``batch_size`` splits it into multiple queries:
+
+.. code-block:: python
+
+   users = list(User.select())
+   for user in users:
+       user.credits -= 10
+
+   try:
+       User.bulk_update_optimistic(users, ['credits'], 'version')
+   except OptimisticConcurrencyError as exc:
+       # exc.conflicts holds the primary keys of rows that were deleted or
+       # modified by someone else. No rows were changed.
+       report_conflict(exc.conflicts)
+
+On conflict no changes are applied and the instances are left untouched, so
+you can re-read the conflicting rows and retry. Currently only single-column
+primary keys on SQLite are supported.
+
 .. _upsert:
 
 Upsert
