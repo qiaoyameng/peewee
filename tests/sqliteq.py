@@ -210,6 +210,77 @@ class BaseTestQueueDatabase(object):
 
         self.database.stop()
 
+    def test_atomic_unsupported_outside_transaction(self):
+        self.assertRaises(ValueError, self.database.atomic)
+        self.assertRaises(ValueError, self.database.transaction)
+        self.assertRaises(ValueError, self.database.savepoint)
+
+    def test_execute_transaction(self):
+        self.database.start()
+
+        def callback():
+            User.create(name='huey')
+            # Reads observe the unit's own uncommitted writes.
+            self.assertEqual(User.select().count(), 1)
+            User.create(name='mickey')
+            return User.select().count()
+
+        self.assertEqual(self.database.execute_transaction(callback), 2)
+        self.assertEqual(
+            sorted(u.name for u in User.select()), ['huey', 'mickey'])
+        self.database.stop()
+
+    def test_execute_transaction_savepoint(self):
+        self.database.start()
+
+        def callback():
+            User.create(name='huey')
+            try:
+                with self.database.atomic():
+                    User.create(name='mickey')
+                    raise RuntimeError('rollback the savepoint')
+            except RuntimeError:
+                pass
+            User.create(name='zaizee')
+            return 'ok'
+
+        self.assertEqual(self.database.execute_transaction(callback), 'ok')
+        self.assertEqual(
+            [u.name for u in User.select().order_by(User.name)],
+            ['huey', 'zaizee'])
+        self.database.stop()
+
+    def test_execute_transaction_error(self):
+        self.database.start()
+
+        def bad_callback():
+            User.create(name='huey')
+            raise ValueError('nope')
+
+        self.assertRaises(
+            ValueError, self.database.execute_transaction, bad_callback)
+        # The failed unit was rolled back.
+        self.assertEqual(User.select().count(), 0)
+
+        # The writer thread still processes subsequent work.
+        User.create(name='mickey')
+        self.assertEqual(
+            self.database.execute_transaction(lambda: 'still ok'), 'still ok')
+        self.assertEqual(User.select().count(), 1)
+        self.database.stop()
+
+    def test_execute_transaction_recursive(self):
+        self.database.start()
+
+        def callback():
+            return self.database.execute_transaction(lambda: 'nested')
+
+        self.assertRaises(
+            RuntimeError, self.database.execute_transaction, callback)
+        # The writer thread still processes subsequent work.
+        self.assertEqual(self.database.execute_transaction(lambda: 'ok'), 'ok')
+        self.database.stop()
+
 
 class TestThreadedDatabaseThreads(BaseTestQueueDatabase, BaseTestCase):
     database_config = {'use_gevent': False}
@@ -246,6 +317,168 @@ class TestThreadedDatabaseThreads(BaseTestQueueDatabase, BaseTestCase):
         self.assertRaises(ResultTimeout, do_query)
         self.database.stop()
 
+    def test_thread_helper_is_threading(self):
+        from playhouse.sqliteq import GreenletHelper
+        from playhouse.sqliteq import ThreadHelper
+        self.assertIsInstance(self.database._thread_helper, ThreadHelper)
+        self.assertNotIsInstance(self.database._thread_helper, GreenletHelper)
+
+    def test_transaction_not_interleaved(self):
+        self.database.start()
+        in_txn = threading.Event()
+        release = threading.Event()
+        results = {}
+
+        def callback():
+            in_txn.set()
+            self.assertTrue(release.wait(5))
+            first = User.create(name='t1').id
+            User.create(name='t2')
+            last = User.create(name='t3').id
+            return first, last
+
+        def run_txn():
+            results['txn'] = self.database.execute_transaction(callback)
+
+        def run_write():
+            results['write'] = User.create(name='w').id
+
+        t_txn = threading.Thread(target=run_txn)
+        t_txn.daemon = True
+        t_txn.start()
+        self.assertTrue(in_txn.wait(5))
+
+        # Enqueue an ordinary write while the transaction unit is blocked
+        # mid-callback. It must wait for the unit to finish.
+        t_write = threading.Thread(target=run_write)
+        t_write.daemon = True
+        t_write.start()
+        time.sleep(0.1)
+        self.assertTrue(t_write.is_alive())
+
+        release.set()
+        t_txn.join(5)
+        t_write.join(5)
+
+        first, last = results['txn']
+        # The unit's rows have contiguous ids -- no interleaved commits.
+        self.assertEqual(last - first, 2)
+        # The queued write ran after the transaction unit, in queue order.
+        self.assertEqual(results['write'], last + 1)
+        self.database.stop()
+
+    def test_execute_transaction_timeout(self):
+        self.database.start()
+        started = threading.Event()
+        release = threading.Event()
+
+        def callback():
+            started.set()
+            release.wait(5)
+            User.create(name='huey')
+            return 'done'
+
+        def release_soon():
+            time.sleep(0.3)
+            release.set()
+
+        t = threading.Thread(target=release_soon)
+        t.daemon = True
+        t.start()
+
+        # The caller's wait times out while the callback is still running.
+        self.assertRaises(
+            ResultTimeout,
+            self.database.execute_transaction, callback, 0.1)
+        self.assertTrue(started.is_set())
+
+        # The callback is not killed: it finishes and commits.
+        for _ in range(100):
+            if User.select().count() == 1:
+                break
+            time.sleep(0.05)
+        self.assertEqual(User.select().count(), 1)
+
+        # The writer thread still processes subsequent work.
+        self.assertEqual(self.database.execute_transaction(lambda: 'ok'), 'ok')
+        self.database.stop()
+
+    def test_pause_waits_for_transaction(self):
+        self.database.start()
+        started = threading.Event()
+        release = threading.Event()
+        results = {}
+
+        def callback():
+            started.set()
+            release.wait(5)
+            User.create(name='txn')
+            return 'ok'
+
+        def run_txn():
+            results['txn'] = self.database.execute_transaction(callback)
+
+        t_txn = threading.Thread(target=run_txn)
+        t_txn.daemon = True
+        t_txn.start()
+        self.assertTrue(started.wait(5))
+
+        t_pause = threading.Thread(target=self.database.pause)
+        t_pause.daemon = True
+        t_pause.start()
+        time.sleep(0.1)
+        # Pause cannot take effect until the unit completes.
+        self.assertTrue(t_pause.is_alive())
+
+        release.set()
+        t_pause.join(5)
+        t_txn.join(5)
+        self.assertFalse(t_pause.is_alive())
+        self.assertEqual(results['txn'], 'ok')
+
+        self.assertRaises(WriterPaused, User.create, name='nope')
+        self.database.unpause()
+        User.create(name='after')
+        self.assertEqual(
+            sorted(u.name for u in User.select()), ['after', 'txn'])
+        self.database.stop()
+
+    def test_stop_waits_for_transaction(self):
+        self.database.start()
+        started = threading.Event()
+        release = threading.Event()
+        results = {}
+
+        def callback():
+            started.set()
+            release.wait(5)
+            User.create(name='txn')
+            return 'committed'
+
+        def run_txn():
+            results['txn'] = self.database.execute_transaction(callback)
+
+        t_txn = threading.Thread(target=run_txn)
+        t_txn.daemon = True
+        t_txn.start()
+        self.assertTrue(started.wait(5))
+
+        t_stop = threading.Thread(target=self.database.stop)
+        t_stop.daemon = True
+        t_stop.start()
+        time.sleep(0.1)
+        # Stop cannot take effect until the unit completes.
+        self.assertTrue(t_stop.is_alive())
+
+        release.set()
+        t_stop.join(5)
+        t_txn.join(5)
+        self.assertFalse(t_stop.is_alive())
+        self.assertEqual(results['txn'], 'committed')
+
+        # The unit's commit is durable after the writer shut down.
+        self.assertEqual([u.name for u in User.select()], ['txn'])
+
 
 @skip_if(gevent is None, 'gevent not installed')
 class TestThreadedDatabaseGreenlets(BaseTestQueueDatabase, BaseTestCase):
@@ -258,3 +491,7 @@ class TestThreadedDatabaseGreenlets(BaseTestQueueDatabase, BaseTestCase):
 
     def create_event(self):
         return GreenEvent()
+
+    def test_thread_helper_is_greenlet(self):
+        from playhouse.sqliteq import GreenletHelper
+        self.assertIsInstance(self.database._thread_helper, GreenletHelper)

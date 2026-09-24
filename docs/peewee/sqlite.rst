@@ -920,11 +920,38 @@ Stop the writer thread on application shutdown (waits for pending writes):
 Read queries work as normal. Open and close the connection per-request as you
 would with any other database. Only writes are funneled through the queue.
 
-**Transactions are not supported.** Because writes from different threads
-are interleaved, there is no way to guarantee that the statements in a
-transaction from one thread execute atomically without statements from
-another thread appearing between them. The ``atomic()`` and
-``transaction()`` methods raise a ``ValueError`` if called.
+**Transactions require** :meth:`~SqliteQueueDatabase.execute_transaction`.
+Because writes from different threads are interleaved on the queue, the
+ordinary ``atomic()``, ``transaction()`` and ``savepoint()`` methods raise
+a ``ValueError`` when called from application threads. To run a group of
+statements atomically, pass a callback to
+:meth:`~SqliteQueueDatabase.execute_transaction`. The callback executes
+synchronously on the writer thread, inside a transaction on the writer's
+connection, so no other writes or transaction units can interleave with it.
+Within the callback, ``atomic()`` (and friends) are available and nested
+``atomic()`` blocks behave as savepoints.
+
+.. code-block:: python
+
+   def transfer(amount):
+       # Runs on the writer thread, inside a transaction.
+       src = Account.get(Account.name == 'from')
+       dst = Account.get(Account.name == 'to')
+       src.balance -= amount
+       dst.balance += amount
+       src.save()
+       dst.save()
+       return src.balance  # Reads see this unit's uncommitted writes.
+
+   new_balance = db.execute_transaction(transfer, timeout=5.0)
+
+If the callback raises, or the commit fails, the transaction is rolled back
+and the original exception is re-raised in the calling thread; the writer
+thread continues processing subsequent work. The ``timeout`` only limits
+how long the *caller* waits for the result -- a callback that has already
+started is never killed or retried when the timeout expires. Calling
+``execute_transaction()`` recursively from within a callback raises
+``RuntimeError``.
 
 To write directly, bypassing the queue (for example, a bulk import through
 a separate connection), use :meth:`~SqliteQueueDatabase.pause` and
@@ -964,6 +991,32 @@ disconnected, and writes submitted through the queue raise ``WriterPaused``.
    .. method:: unpause()
 
       Resume the writer thread and reconnect the queue.
+
+   .. method:: execute_transaction(callback, timeout=None)
+
+      Execute ``callback`` as an atomic unit of work on the writer thread.
+      The callback runs synchronously inside a transaction on the writer's
+      connection; queries it issues through this database execute directly
+      against that connection (they are not re-queued), so reads observe
+      the unit's own uncommitted writes, and nested ``atomic()`` blocks act
+      as savepoints. Ordinary writes and other transaction units queued in
+      the meantime run only after the unit commits or rolls back, in queue
+      order. ``pause()``/``stop()`` requests that arrive while a unit is
+      executing take effect only after the unit completes.
+
+      On success the transaction is committed and the callback's return
+      value is returned. If the callback raises or the commit fails, the
+      transaction is rolled back and the original exception is re-raised in
+      the calling thread.
+
+      :param callable callback: function to run inside the transaction.
+      :param float timeout: seconds the *caller* waits for the result
+          (defaults to ``results_timeout``). The timeout does not interrupt
+          a callback that has already started: it is never killed or
+          retried, and still commits or rolls back as usual.
+      :raises ResultTimeout: if the caller's wait exceeds ``timeout``.
+      :raises RuntimeError: if called recursively from within a transaction
+          callback.
 
 
 .. _sqlite-fields:
@@ -2638,4 +2691,3 @@ Available functions
    SequenceMatcher's algorithm.
 
    .. note:: Only available if you compiled the ``_sqlite_udf`` extension.
-

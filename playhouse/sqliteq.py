@@ -1,5 +1,6 @@
 import logging
 from queue import Queue
+from threading import current_thread
 from threading import Event
 from threading import Lock
 from threading import Thread
@@ -113,6 +114,30 @@ SHUTDOWN = StopIteration
 QUERY = object()
 PAUSE = object()
 UNPAUSE = object()
+TRANSACTION = object()
+
+
+class TransactionResult(object):
+    __slots__ = ('callback', 'timeout', '_event', '_value', '_exc')
+
+    def __init__(self, event, callback, timeout):
+        self._event = event
+        self.callback = callback
+        self.timeout = timeout
+        self._value = self._exc = None
+
+    def set_result(self, value, exc=None):
+        self._value = value
+        self._exc = exc
+        self._event.set()
+
+    def result(self):
+        if not self._event.wait(timeout=self.timeout) and \
+                self.timeout is not None:
+            raise ResultTimeout('transaction result not ready, timed out.')
+        if self._exc is not None:
+            raise self._exc
+        return self._value
 
 
 class Writer(object):
@@ -124,6 +149,7 @@ class Writer(object):
 
     def run(self):
         conn = self.database.connection()
+        self.database._writer_ident = self.database._thread_helper.current()
         try:
             while True:
                 try:
@@ -159,6 +185,8 @@ class Writer(object):
         op, obj = self.queue.get()
         if op is QUERY:
             self.execute(obj)
+        elif op is TRANSACTION:
+            self.run_transaction(obj)
         elif op is PAUSE:
             logger.info('writer paused - closing database connection.')
             self.database._close(conn)
@@ -184,6 +212,23 @@ class Writer(object):
         else:
             exc = None
         return obj.set_result(cursor, exc)
+
+    def run_transaction(self, obj):
+        # The callback runs synchronously on the writer thread, inside a
+        # transaction on the writer's connection. While the flag is set,
+        # database operations issued by the callback execute directly on
+        # the writer's connection rather than being re-queued.
+        db = self.database
+        db._txn_active = True
+        try:
+            with SqliteDatabase.atomic(db):
+                value = obj.callback()
+        except BaseException as txn_exc:
+            obj.set_result(None, txn_exc)
+        else:
+            obj.set_result(value)
+        finally:
+            db._txn_active = False
 
 
 class SqliteQueueDatabase(SqliteDatabase):
@@ -216,6 +261,8 @@ class SqliteQueueDatabase(SqliteDatabase):
         self._autostart = autostart
         self._results_timeout = results_timeout
         self._is_stopped = True
+        self._txn_active = False
+        self._writer_ident = None
 
         # Get different objects depending on the threading implementation.
         self._thread_helper = self.get_thread_impl(use_gevent)(queue_max_size)
@@ -246,8 +293,14 @@ class SqliteQueueDatabase(SqliteDatabase):
     def queue_size(self):
         return self._write_queue.qsize()
 
+    def _in_transaction_unit(self):
+        # Only the writer thread ever runs transaction callbacks, so the
+        # flag is only meaningful when checked from the writer itself.
+        return (self._txn_active and
+                self._thread_helper.current() is self._writer_ident)
+
     def execute_sql(self, sql, params=None, timeout=None):
-        if sql.lower().startswith('select'):
+        if sql.lower().startswith('select') or self._in_transaction_unit():
             return self._execute(sql, params)
 
         cursor = AsyncCursor(
@@ -257,6 +310,41 @@ class SqliteQueueDatabase(SqliteDatabase):
             timeout=self._results_timeout if timeout is None else timeout)
         self._write_queue.put((QUERY, cursor))
         return cursor
+
+    def execute_transaction(self, callback, timeout=None):
+        """
+        Execute ``callback`` as an atomic unit of work on the writer thread.
+
+        The callback runs synchronously on the background writer thread,
+        inside a transaction on the writer's connection. Queries issued by
+        the callback (through this database) execute directly against that
+        connection, so reads observe the unit's own uncommitted writes, and
+        nested ``atomic()`` blocks behave as savepoints. No other queued
+        writes or transaction units can interleave with the callback.
+
+        On success the transaction is committed and the callback's return
+        value is returned to the caller. If the callback raises, or the
+        commit fails, the transaction is rolled back and the original
+        exception is re-raised in the calling thread; the writer thread
+        remains available for subsequent work.
+
+        ``timeout`` only bounds how long the *caller* waits for the result
+        (defaulting to ``results_timeout``). If it expires, ``ResultTimeout``
+        is raised, but a callback that has already started is neither killed
+        nor retried -- it runs to completion and commits or rolls back as
+        usual. Calling ``execute_transaction()`` recursively from within a
+        transaction callback raises ``RuntimeError``.
+        """
+        if self._in_transaction_unit():
+            raise RuntimeError(
+                'execute_transaction() cannot be called recursively from '
+                'within a transaction callback.')
+        result = TransactionResult(
+            event=self._thread_helper.event(),
+            callback=callback,
+            timeout=self._results_timeout if timeout is None else timeout)
+        self._write_queue.put((TRANSACTION, result))
+        return result.result()
 
     def start(self):
         with self._qlock:
@@ -288,7 +376,7 @@ class SqliteQueueDatabase(SqliteDatabase):
             op, obj = self._write_queue.get()
             if op is PAUSE or op is UNPAUSE:
                 obj.set()
-            elif op is QUERY:
+            elif op is QUERY or op is TRANSACTION:
                 obj.set_result(None, ShutdownException())
 
         return True
@@ -317,9 +405,26 @@ class SqliteQueueDatabase(SqliteDatabase):
 
         evt.wait()
 
-    def __unsupported__(self, *args, **kwargs):
-        raise ValueError('This method is not supported by %r.' % type(self))
-    atomic = transaction = savepoint = __unsupported__
+    def atomic(self, *args, **kwargs):
+        if not self._in_transaction_unit():
+            raise ValueError(
+                'atomic() is only supported on the writer thread, within '
+                'an execute_transaction() callback.')
+        return super(SqliteQueueDatabase, self).atomic(*args, **kwargs)
+
+    def transaction(self, *args, **kwargs):
+        if not self._in_transaction_unit():
+            raise ValueError(
+                'transaction() is only supported on the writer thread, '
+                'within an execute_transaction() callback.')
+        return super(SqliteQueueDatabase, self).transaction(*args, **kwargs)
+
+    def savepoint(self, *args, **kwargs):
+        if not self._in_transaction_unit():
+            raise ValueError(
+                'savepoint() is only supported on the writer thread, '
+                'within an execute_transaction() callback.')
+        return super(SqliteQueueDatabase, self).savepoint(*args, **kwargs)
 
 
 class ThreadHelper(object):
@@ -329,6 +434,8 @@ class ThreadHelper(object):
         self.queue_max_size = queue_max_size
 
     def event(self): return Event()
+
+    def current(self): return current_thread()
 
     def queue(self, max_size=None):
         max_size = max_size if max_size is not None else self.queue_max_size
@@ -344,6 +451,8 @@ class GreenletHelper(ThreadHelper):
     __slots__ = ()
 
     def event(self): return GEvent()
+
+    def current(self): return gevent.getcurrent()
 
     def queue(self, max_size=None):
         max_size = max_size if max_size is not None else self.queue_max_size
