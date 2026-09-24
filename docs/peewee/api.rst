@@ -1185,6 +1185,53 @@ Database
       Create a transaction context-manager / decorator, optionally using the
       specified locking strategy (default DEFERRED).
 
+   .. method:: run_in_transaction(callback, max_attempts=3, backoff=(0.05, 0.1, 0.2))
+
+      :param callback: Callable that executes the transactional work and
+         whose return value becomes the result. It may be executed **multiple
+         times**, so it must not perform external side-effects that cannot
+         safely be replayed.
+      :param int max_attempts: Maximum number of attempts, *including* the
+         first one. Must be >= 1; retries are never unbounded.
+      :param backoff: Iterable of non-negative numbers of seconds to wait
+         between attempts. One delay is consumed before each retry, and when
+         the sequence is exhausted no further retries are made, so the
+         effective number of attempts is at most
+         ``min(max_attempts, 1 + len(backoff))``.
+
+      Run ``callback()`` inside a transaction, re-running the *entire*
+      callback when SQLite reports lock contention. Only errors that
+      unambiguously report ``SQLITE_BUSY`` or ``SQLITE_LOCKED`` (including
+      their extended result codes, via the driver's numeric error code) are
+      retried, and only after the failed attempt's rollback has been
+      confirmed. Constraint violations, exceptions raised by the callback
+      itself, cancellation exceptions (e.g. ``KeyboardInterrupt``), and
+      errors for which the rollback cannot be confirmed (such as an invalid
+      connection) propagate immediately.
+
+      :py:meth:`~Database.after_commit` callbacks registered by a failed
+      attempt are discarded; only the callbacks registered by the attempt
+      that ultimately commits are executed. If an after-commit callback
+      raises after a successful commit, the error propagates without
+      re-running the transaction.
+
+      This method cannot be called from within a transaction or a
+      :py:meth:`~Database.manual_commit` block, and raises ``ValueError`` if
+      it is.
+
+      .. code-block:: python
+
+          def transfer():
+              src.balance -= amount
+              dst.balance += amount
+              src.save()
+              dst.save()
+
+          db.run_in_transaction(transfer, max_attempts=3,
+                                backoff=(0.05, 0.1, 0.2))
+
+      .. seealso:: :ref:`sqlite-retry-transactions`
+
 
 .. class:: PostgresqlDatabase(database, register_unicode=True, encoding=None, isolation_level=None, prefer_psycopg3=False)
 

@@ -5,10 +5,15 @@ tests.
 Most test cases use the Register model (a single IntegerField) from
 base_models, via BaseTransactionTestCase.
 """
+import os
+import shutil
+import tempfile
 import threading
 
 from peewee import *
+from peewee import sqlite3
 
+from .base import BaseTestCase
 from .base import DatabaseTestCase
 from .base import IS_CRDB
 from .base import IS_CRDB_NESTED_TX
@@ -863,3 +868,263 @@ class TestPostgresIsolationLevel(DatabaseTestCase):
         conn = db.connection()
         self.assertEqual(conn.isolation_level, rc)
         db.close()
+
+
+# ===========================================================================
+# SqliteDatabase.run_in_transaction()
+# ===========================================================================
+
+class _WriteLockHolder(threading.Thread):
+    """
+    Holds a SQLite write lock on the given database file (from a separate
+    connection) until ``release`` is set. ``barrier`` is used to signal that
+    the lock has been acquired.
+    """
+    def __init__(self, db_file, barrier, release):
+        super(_WriteLockHolder, self).__init__()
+        self.daemon = True
+        self.db_file = db_file
+        self.barrier = barrier
+        self.release = release
+        self.error = None
+
+    def run(self):
+        try:
+            conn = sqlite3.connect(self.db_file, isolation_level=None)
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                conn.execute("INSERT INTO kv (k, v) VALUES ('holder', 1)")
+                self.barrier.wait(5)  # Lock held; let the test proceed.
+                self.release.wait(5)
+                conn.execute('COMMIT')
+            finally:
+                conn.close()
+        except Exception as exc:
+            self.error = exc
+
+
+@skip_unless(IS_SQLITE, 'requires sqlite')
+class TestRunInTransaction(BaseTestCase):
+    def setUp(self):
+        super(TestRunInTransaction, self).setUp()
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_file = os.path.join(self.temp_dir, 'run_in_transaction.db')
+        # Use a short busy-timeout so lock contention surfaces quickly.
+        self.db = SqliteDatabase(self.db_file, timeout=0.1)
+        self.db.execute_sql('CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER)')
+
+    def tearDown(self):
+        self.db.close()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        super(TestRunInTransaction, self).tearDown()
+
+    def start_lock_holder(self):
+        barrier = threading.Barrier(2)
+        release = threading.Event()
+        holder = _WriteLockHolder(self.db_file, barrier, release)
+        holder.start()
+        return barrier, release, holder
+
+    def values(self, key='a'):
+        cursor = self.db.execute_sql('SELECT v FROM kv WHERE k = ?', (key,))
+        return [row[0] for row in cursor.fetchall()]
+
+    def test_retry_succeeds_after_lock_released(self):
+        barrier, release, holder = self.start_lock_holder()
+        attempts = []
+        commits = []
+
+        def callback():
+            attempts.append(1)
+            if len(attempts) == 1:
+                barrier.wait(5)  # Wait until the holder owns the write lock.
+                try:
+                    self.db.execute_sql("INSERT INTO kv VALUES ('a', 1)")
+                except OperationalError:
+                    release.set()  # Have the holder commit, releasing lock.
+                    raise
+            else:
+                self.db.execute_sql("INSERT INTO kv VALUES ('a', 2)")
+            self.db.after_commit(lambda: commits.append(1))
+            return len(attempts)
+
+        result = self.db.run_in_transaction(callback, max_attempts=3,
+                                            backoff=(0.01, 0.01))
+        holder.join(5)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(len(attempts), 2)
+        # Only the successful attempt's after-commit callbacks ran.
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(self.values('a'), [2])
+        self.assertEqual(self.values('holder'), [1])
+        self.assertIsNone(holder.error)
+
+    def test_attempts_exhausted(self):
+        barrier, release, holder = self.start_lock_holder()
+        attempts = []
+
+        def callback():
+            attempts.append(1)
+            if len(attempts) == 1:
+                barrier.wait(5)  # Lock is held for the whole test.
+            self.db.execute_sql("INSERT INTO kv VALUES ('a', 1)")
+
+        with self.assertRaises(OperationalError):
+            self.db.run_in_transaction(callback, max_attempts=3,
+                                       backoff=(0.01, 0.01, 0.01))
+        release.set()
+        holder.join(5)
+
+        # max_attempts includes the first attempt.
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(self.values('a'), [])  # All attempts rolled back.
+        self.assertIsNone(holder.error)
+
+    def test_backoff_exhaustion_stops_retries(self):
+        barrier, release, holder = self.start_lock_holder()
+        attempts = []
+
+        def callback():
+            attempts.append(1)
+            if len(attempts) == 1:
+                barrier.wait(5)
+            self.db.execute_sql("INSERT INTO kv VALUES ('a', 1)")
+
+        with self.assertRaises(OperationalError):
+            # A single backoff delay permits exactly one retry, even though
+            # max_attempts would allow more.
+            self.db.run_in_transaction(callback, max_attempts=5,
+                                       backoff=(0.01,))
+        release.set()
+        holder.join(5)
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.values('a'), [])
+        self.assertIsNone(holder.error)
+
+    def test_constraint_error_not_retried(self):
+        self.db.execute_sql("INSERT INTO kv VALUES ('a', 1)")
+        attempts = []
+
+        def callback():
+            attempts.append(1)
+            self.db.execute_sql("INSERT INTO kv VALUES ('a', 2)")  # Dupe key.
+
+        with self.assertRaises(IntegrityError):
+            self.db.run_in_transaction(callback, max_attempts=3,
+                                       backoff=(0.01, 0.01))
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.values('a'), [1])
+
+    def test_callback_exception_not_retried(self):
+        attempts = []
+
+        def callback():
+            attempts.append(1)
+            self.db.execute_sql("INSERT INTO kv VALUES ('a', 1)")
+            raise ValueError('business logic failed')
+
+        with self.assertRaises(ValueError):
+            self.db.run_in_transaction(callback, max_attempts=3,
+                                       backoff=(0.01, 0.01))
+
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.values('a'), [])  # Rolled back.
+
+    def test_cancellation_not_retried(self):
+        attempts = []
+
+        def callback():
+            attempts.append(1)
+            raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.db.run_in_transaction(callback, max_attempts=3,
+                                       backoff=(0.01, 0.01))
+
+        self.assertEqual(len(attempts), 1)
+
+    def test_connection_invalidated_not_retried(self):
+        attempts = []
+
+        def callback():
+            attempts.append(1)
+            self.db.execute_sql("INSERT INTO kv VALUES ('a', 1)")
+            # Invalidate the connection mid-transaction.
+            self.db.connection().close()
+
+        with self.assertRaises(ProgrammingError):
+            self.db.run_in_transaction(callback, max_attempts=3,
+                                       backoff=(0.01, 0.01))
+
+        self.assertEqual(len(attempts), 1)
+
+    def test_error_message_text_is_not_used(self):
+        # A peewee OperationalError whose *message* looks like a lock error,
+        # but which carries no SQLite error code, must not be retried.
+        attempts = []
+
+        def callback():
+            attempts.append(1)
+            raise OperationalError('database is locked')
+
+        with self.assertRaises(OperationalError):
+            self.db.run_in_transaction(callback, max_attempts=3,
+                                       backoff=(0.01, 0.01))
+
+        self.assertEqual(len(attempts), 1)
+
+    def test_after_commit_error_does_not_replay(self):
+        attempts = []
+
+        def callback():
+            attempts.append(1)
+            self.db.execute_sql("INSERT INTO kv VALUES ('a', 1)")
+            self.db.after_commit(fail)
+
+        def fail():
+            raise RuntimeError('after-commit callback failed')
+
+        with self.assertRaises(RuntimeError):
+            self.db.run_in_transaction(callback, max_attempts=3,
+                                       backoff=(0.01, 0.01))
+
+        # The transaction committed, so the callback is not re-run and the
+        # committed data remains.
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.values('a'), [1])
+
+    def test_success_without_contention(self):
+        commits = []
+
+        def callback():
+            self.db.execute_sql("INSERT INTO kv VALUES ('a', 1)")
+            self.db.after_commit(lambda: commits.append(1))
+            return 'ok'
+
+        result = self.db.run_in_transaction(callback, max_attempts=3,
+                                            backoff=(0.01, 0.01))
+
+        self.assertEqual(result, 'ok')
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(self.values('a'), [1])
+
+    def test_rejected_inside_transaction(self):
+        with self.db.atomic():
+            self.assertRaises(ValueError, self.db.run_in_transaction,
+                              lambda: None)
+        with self.db.manual_commit():
+            self.assertRaises(ValueError, self.db.run_in_transaction,
+                              lambda: None)
+
+    def test_invalid_arguments(self):
+        self.assertRaises(ValueError, self.db.run_in_transaction,
+                          lambda: None, 0)
+        self.assertRaises(ValueError, self.db.run_in_transaction,
+                          lambda: None, -1)
+        self.assertRaises(ValueError, self.db.run_in_transaction,
+                          lambda: None, 3, (-0.1,))
+        self.assertRaises(ValueError, self.db.run_in_transaction,
+                          lambda: None, 3, ('soon',))

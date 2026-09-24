@@ -68,6 +68,13 @@ except ImportError:
     except ImportError:
         mysql = None
 
+# SQLite primary result codes for lock-contention errors. Extended result
+# codes (e.g. SQLITE_BUSY_SNAPSHOT) share the primary code in the low byte,
+# so they are detected by masking with 0xff rather than by matching error
+# message text.
+SQLITE_BUSY = getattr(sqlite3, 'SQLITE_BUSY', 5)
+SQLITE_LOCKED = getattr(sqlite3, 'SQLITE_LOCKED', 6)
+
 
 __version__ = '4.5.1'
 __all__ = [
@@ -4204,6 +4211,24 @@ def __pragma__(name):
     return property(__get__, __set__)
 
 
+def _is_sqlite_lock_error(exc):
+    # Determine whether the exception unambiguously reports a SQLite
+    # lock-contention error (SQLITE_BUSY or SQLITE_LOCKED, including their
+    # extended result codes). The driver's numeric error code is inspected
+    # rather than the error message text.
+    if sqlite3 is None or not isinstance(exc, OperationalError):
+        return False
+    # Peewee's DB-API wrapper stores the original driver exception in
+    # ``orig`` (see PeeweeException).
+    original = getattr(exc, 'orig', None)
+    if not isinstance(original, sqlite3.Error):
+        return False
+    code = getattr(original, 'sqlite_errorcode', None)
+    if code is None:
+        return False
+    return code & 0xff in (SQLITE_BUSY, SQLITE_LOCKED)
+
+
 class SqliteDatabase(Database):
     field_types = {
         'BIGAUTO': FIELD.AUTO,
@@ -4463,6 +4488,90 @@ class SqliteDatabase(Database):
         statement = 'BEGIN %s' % lock_type if lock_type else 'BEGIN'
         with __exception_wrapper__:
             self.cursor().execute(statement)
+
+    def run_in_transaction(self, callback, max_attempts=3,
+                           backoff=(0.05, 0.1, 0.2)):
+        """
+        Run ``callback()`` inside a transaction, retrying the *entire*
+        callback when SQLite reports lock contention (``SQLITE_BUSY`` or
+        ``SQLITE_LOCKED``, including extended result codes).
+
+        :param callback: Callable executing the transactional work. It may be
+            executed multiple times, so it must not perform external
+            side-effects that cannot safely be replayed.
+        :param int max_attempts: Maximum number of attempts, including the
+            first one. Must be >= 1; retries are never unbounded.
+        :param backoff: Iterable of non-negative numbers of seconds to wait
+            between attempts. One delay is consumed before each retry. If the
+            sequence is exhausted before ``max_attempts`` is reached, no
+            further retries are made, so the effective number of attempts is
+            at most ``min(max_attempts, 1 + len(backoff))``.
+        :return: The value returned by ``callback()`` on the successful
+            attempt.
+
+        A failed attempt is only retried once its rollback has been
+        confirmed. Constraint violations, exceptions raised by the callback
+        itself, cancellation/exceptions such as ``KeyboardInterrupt``, and
+        errors for which the rollback cannot be confirmed (e.g. an invalid
+        connection) always propagate immediately.
+
+        ``after_commit()`` callbacks registered by a failed attempt are
+        discarded; only the callbacks registered by the attempt that
+        ultimately commits are executed. If an ``after_commit()`` callback
+        fails after a successful commit, the error propagates without
+        re-running the transaction.
+
+        This method cannot be called from within a transaction or a
+        ``manual_commit()`` block, since the surrounding work has not been
+        authorized for replay.
+        """
+        if self.transaction_depth() > 0:
+            raise ValueError('run_in_transaction() cannot be called from '
+                             'within a transaction or manual-commit block.')
+        if not isinstance(max_attempts, int) or max_attempts < 1:
+            raise ValueError('max_attempts must be a positive integer.')
+        delays = []
+        for delay in backoff:
+            if not isinstance(delay, (int, float)) or delay < 0:
+                raise ValueError('backoff must be an iterable of '
+                                 'non-negative numbers.')
+            delays.append(delay)
+
+        attempt = 0
+        while True:
+            attempt += 1
+            txn = _transaction(self)
+            txn._begin()
+            self.push_transaction(txn)
+            try:
+                result = callback()
+                self.commit()
+            except BaseException as exc:
+                self.pop_transaction()
+                # If the rollback itself fails, that error propagates and no
+                # retry is attempted, since we cannot confirm the failed
+                # attempt was rolled back.
+                self.rollback()
+                self._clear_commit_callbacks()
+                delay = self._get_retry_delay(exc, attempt, max_attempts,
+                                              delays)
+                if delay is None:
+                    raise
+                if delay:
+                    time.sleep(delay)
+                continue
+            self.pop_transaction()
+            # The commit succeeded, so errors raised by after-commit
+            # callbacks propagate without re-running the transaction.
+            self._run_commit_callbacks()
+            return result
+
+    def _get_retry_delay(self, exc, attempt, max_attempts, delays):
+        if attempt >= max_attempts or not delays:
+            return None
+        if not _is_sqlite_lock_error(exc):
+            return None
+        return delays.pop(0)
 
     def get_tables(self, schema=None):
         schema = qesc(schema or 'main')

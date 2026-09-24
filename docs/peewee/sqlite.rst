@@ -374,6 +374,49 @@ For more information, see the SQLite `locking documentation <https://sqlite.org/
 To learn more about transactions in Peewee, see the :ref:`transactions`
 documentation.
 
+.. _sqlite-retry-transactions:
+
+Retrying Transactions on Lock Contention
+----------------------------------------
+
+Because SQLite permits only a single writer at a time, short transactions
+may fail with ``SQLITE_BUSY`` or ``SQLITE_LOCKED`` when another connection
+holds the write lock. :py:meth:`SqliteDatabase.run_in_transaction` runs a
+callback inside a transaction and re-executes the *entire* callback when
+this happens:
+
+.. code-block:: python
+
+    db = SqliteDatabase('app.db', timeout=0.1)
+
+    def place_order():
+        # All statements in the callback run in one transaction.
+        Order.create(...)
+        update_inventory(...)
+
+    db.run_in_transaction(place_order, max_attempts=3,
+                          backoff=(0.05, 0.1, 0.2))
+
+Important properties:
+
+* The callback may be executed **multiple times**. Do not use it to perform
+  external side-effects (sending email, charging a card, etc.) that cannot
+  safely be replayed.
+* Retries only occur when SQLite unambiguously reports ``SQLITE_BUSY`` or
+  ``SQLITE_LOCKED`` (including extended result codes), and only after the
+  failed attempt's rollback has been confirmed. Constraint violations,
+  exceptions raised by the callback itself, and cancellation exceptions
+  propagate immediately.
+* ``max_attempts`` includes the first attempt, and one ``backoff`` delay is
+  consumed before each retry. When the ``backoff`` sequence is exhausted, no
+  further retries are made, so retries are always bounded.
+* :py:meth:`~Database.after_commit` callbacks registered by a failed
+  attempt are discarded; only the callbacks from the attempt that ultimately
+  commits are executed. An error in an after-commit callback does not cause
+  the transaction to be re-run.
+* It cannot be called from within a transaction or a
+  :py:meth:`~Database.manual_commit` block.
+
 .. danger::
    Do not alter the ``isolation_level`` property of the ``sqlite3.Connection``
    object. Peewee requires the ``sqlite3`` driver be in autocommit-mode, which
@@ -2638,4 +2681,3 @@ Available functions
    SequenceMatcher's algorithm.
 
    .. note:: Only available if you compiled the ``_sqlite_udf`` extension.
-
