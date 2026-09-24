@@ -1930,6 +1930,47 @@ Model
       For updates that can be expressed as a single WHERE clause, the direct
       :meth:`~Model.update` approach is faster.
 
+   .. classmethod:: bulk_update_with_version(model_list, fields, version, batch_size=None)
+
+      :param iterable model_list: a list or other iterable of saved
+          :class:`Model` instances.
+      :param list fields: list of fields to update. The primary key and the
+          version field may not be included.
+      :param version: an :py:class:`IntegerField` (or its field name) on the
+          model used as the optimistic-concurrency version.
+      :param int batch_size: number of rows to batch per query. If
+          unspecified, all models will be updated in a single query.
+      :return: total number of rows updated.
+      :raises OptimisticConcurrencyError: if any row was deleted or its
+          version changed since the instance was read. The conflicting
+          primary keys are available on the exception's ``conflicts``
+          attribute.
+
+      Optimistic-concurrency variant of :py:meth:`Model.bulk_update`. Each
+      row is only updated when the ``version`` column in the database still
+      equals the value held by the corresponding model instance, and the
+      version is incremented by one on success. The whole call runs in a
+      transaction, so a conflict on any row (even across ``batch_size``
+      batches) rolls back the entire operation, leaving the database and the
+      caller's model instances untouched.
+
+      Example:
+
+      .. code-block:: python
+
+         items = list(Item.select())
+         for item in items:
+             item.price *= 1.1
+
+         try:
+             Item.bulk_update_with_version(items, [Item.price], Item.version)
+         except OptimisticConcurrencyError as exc:
+             print('conflicting ids:', sorted(exc.conflicts))
+
+      .. note::
+         Models with a composite primary key are not supported. All instances
+         must be saved and have unique primary keys.
+
    .. classmethod:: get(*query, **filters)
 
       :param query: Zero or more :class:`Expression` objects.

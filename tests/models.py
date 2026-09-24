@@ -1853,6 +1853,205 @@ class TestModelAPIs(ModelTestCase):
             self.assertEqual(list(query), [])
 
 
+class VersionedItem(TestModel):
+    name = CharField()
+    flag = BooleanField(default=False)
+    birthday = DateField(null=True)
+    version = IntegerField(default=1)
+
+
+class TestBulkUpdateWithVersion(ModelTestCase):
+    requires = [VersionedItem]
+
+    def _create_items(self, n=4):
+        for i in range(n):
+            VersionedItem.create(name='item-%s' % i)
+        return list(VersionedItem.select().order_by(VersionedItem.id))
+
+    def _get_rows(self):
+        return [(i.name, i.flag, i.birthday, i.version)
+                for i in VersionedItem.select().order_by(VersionedItem.id)]
+
+    def _modify_elsewhere(self, pk, delete=False):
+        db2 = new_connection()
+        db2.connect()
+        try:
+            table = VersionedItem._meta.table_name
+            with db2.atomic():
+                if delete:
+                    db2.execute_sql('DELETE FROM "%s" WHERE id = ?' % table,
+                                    (pk,))
+                else:
+                    db2.execute_sql(
+                        'UPDATE "%s" SET version = version + 1, '
+                        'name = name || ? WHERE id = ?' % table,
+                        ('-x', pk))
+        finally:
+            db2.close()
+
+    def test_bulk_update_with_version(self):
+        items = self._create_items(3)
+        items[0].name = 'n0'
+        items[1].flag = True
+        items[2].birthday = '2000-01-02'  # Converted by the DateField.
+
+        n = VersionedItem.bulk_update_with_version(
+            items, ['name', 'flag', 'birthday'], 'version')
+        self.assertEqual(n, 3)
+
+        self.assertEqual(self._get_rows(), [
+            ('n0', False, None, 2),
+            ('item-1', True, None, 2),
+            ('item-2', False, datetime.date(2000, 1, 2), 2)])
+
+        # Instance state is only updated after a successful commit.
+        self.assertEqual([i.version for i in items], [2, 2, 2])
+        self.assertFalse(any(i.is_dirty() for i in items))
+
+    def test_bulk_update_with_version_batching(self):
+        items = self._create_items(5)
+        for i, item in enumerate(items):
+            item.name = 'n%s' % i
+
+        with self.assertQueryCount(3):  # 5 rows / batch_size=2 -> 3 queries.
+            n = VersionedItem.bulk_update_with_version(
+                items, [VersionedItem.name], VersionedItem.version, 2)
+        self.assertEqual(n, 5)
+        self.assertEqual([r[0] for r in self._get_rows()],
+                         ['n0', 'n1', 'n2', 'n3', 'n4'])
+        self.assertEqual([r[3] for r in self._get_rows()], [2] * 5)
+        self.assertEqual([i.version for i in items], [2] * 5)
+
+    def test_bulk_update_with_version_empty(self):
+        with self.assertQueryCount(0):
+            n = VersionedItem.bulk_update_with_version(
+                [], ['name'], 'version')
+        self.assertEqual(n, 0)
+
+    @requires_sqlite
+    def test_bulk_update_with_version_conflict(self):
+        items = self._create_items(3)
+        items[0].name = 'a'
+        items[1].name = 'b'
+        items[2].name = 'c'
+
+        # Another connection modifies the middle row first.
+        self._modify_elsewhere(items[1].id)
+
+        with self.assertRaises(OptimisticConcurrencyError) as ctx:
+            VersionedItem.bulk_update_with_version(
+                items, ['name'], 'version')
+        self.assertEqual(ctx.exception.conflicts, {items[1].id})
+
+        # Nothing was written to the database.
+        self.assertEqual(self._get_rows(), [
+            ('item-0', False, None, 1),
+            ('item-1-x', False, None, 2),
+            ('item-2', False, None, 1)])
+
+        # The caller's instances are untouched and still usable.
+        self.assertEqual([i.version for i in items], [1, 1, 1])
+        self.assertEqual([i.name for i in items], ['a', 'b', 'c'])
+        self.assertTrue(all(i.is_dirty() for i in items))
+
+    @requires_sqlite
+    def test_bulk_update_with_version_deleted_row(self):
+        items = self._create_items(3)
+        for item in items:
+            item.name = 'n-%s' % item.id
+
+        self._modify_elsewhere(items[0].id, delete=True)
+
+        with self.assertRaises(OptimisticConcurrencyError) as ctx:
+            VersionedItem.bulk_update_with_version(
+                items, ['name'], 'version')
+        self.assertEqual(ctx.exception.conflicts, {items[0].id})
+        self.assertEqual([r[0] for r in self._get_rows()],
+                         ['item-1', 'item-2'])
+
+    @requires_sqlite
+    def test_bulk_update_with_version_conflict_across_batches(self):
+        items = self._create_items(5)
+        for i, item in enumerate(items):
+            item.name = 'n%s' % i
+
+        # Conflict occurs in the second batch (batch_size=2).
+        self._modify_elsewhere(items[3].id)
+
+        with self.assertRaises(OptimisticConcurrencyError) as ctx:
+            VersionedItem.bulk_update_with_version(
+                items, ['name'], 'version', 2)
+        self.assertEqual(ctx.exception.conflicts, {items[3].id})
+
+        # The first batch's successful updates were rolled back as well.
+        self.assertEqual(self._get_rows(), [
+            ('item-0', False, None, 1),
+            ('item-1', False, None, 1),
+            ('item-2', False, None, 1),
+            ('item-3-x', False, None, 2),
+            ('item-4', False, None, 1)])
+        self.assertEqual([i.version for i in items], [1] * 5)
+
+    @requires_sqlite
+    def test_bulk_update_with_version_inside_atomic(self):
+        items = self._create_items(2)
+        items[0].name = 'a'
+        items[1].name = 'b'
+        self._modify_elsewhere(items[1].id)
+
+        # A conflict can be caught inside an outer transaction, which then
+        # continues to do useful work and commit.
+        caught = None
+        with self.database.atomic():
+            try:
+                VersionedItem.bulk_update_with_version(
+                    items, ['name'], 'version')
+            except OptimisticConcurrencyError as exc:
+                caught = exc
+            VersionedItem.create(name='after')
+
+        self.assertIsNotNone(caught)
+        self.assertEqual(caught.conflicts, {items[1].id})
+        self.assertEqual(self._get_rows(), [
+            ('item-0', False, None, 1),
+            ('item-1-x', False, None, 2),
+            ('after', False, None, 1)])
+
+    def test_bulk_update_with_version_validation(self):
+        items = self._create_items(1)
+        item = items[0]
+
+        def check(model_list, fields, version, **kwargs):
+            return VersionedItem.bulk_update_with_version(
+                model_list, fields, version, **kwargs)
+
+        # Composite primary keys are rejected.
+        self.assertRaises(
+            ValueError,
+            CPK.bulk_update_with_version, [], ['extra'], 'extra')
+
+        # Duplicate primary keys are rejected.
+        dup = VersionedItem(id=item.id, name='x', version=1)
+        self.assertRaises(ValueError, check, [item, dup], ['name'], 'version')
+
+        # Unsaved instances are rejected.
+        self.assertRaises(ValueError, check, [VersionedItem(name='x')],
+                          ['name'], 'version')
+
+        # The version field must be an integer field on the model.
+        self.assertRaises(ValueError, check, [item], ['flag'], 'name')
+        self.assertRaises(ValueError, check, [item], ['name'], 'missing')
+
+        # The primary key cannot be updated or used as the version field.
+        self.assertRaises(ValueError, check, [item], ['id', 'name'],
+                          'version')
+        self.assertRaises(ValueError, check, [item], ['name'], 'id')
+
+        # The version field cannot be listed as a regular update field.
+        self.assertRaises(ValueError, check, [item], ['name', 'version'],
+                          'version')
+
+
 class Site(TestModel):
     url = TextField()
 

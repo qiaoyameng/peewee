@@ -129,6 +129,7 @@ __all__ = [
     'NotSupportedError',
     'OP',
     'OperationalError',
+    'OptimisticConcurrencyError',
     'PostgresqlDatabase',
     'PrimaryKeyField',  # XXX: Deprecated, change to AutoField.
     'prefetch',
@@ -3635,6 +3636,24 @@ class InternalError(DatabaseError): pass
 class NotSupportedError(DatabaseError): pass
 class OperationalError(DatabaseError): pass
 class ProgrammingError(DatabaseError): pass
+
+
+class OptimisticConcurrencyError(PeeweeException):
+    """Raised when a versioned bulk update cannot be applied because one or
+    more rows were modified or deleted since they were read."""
+    def __init__(self, model, conflicts):
+        self.model = model
+        self.conflicts = frozenset(conflicts)
+        super(OptimisticConcurrencyError, self).__init__(
+            'Version conflict updating %s, conflicting primary keys: %s'
+            % (model.__name__, sorted(self.conflicts)))
+
+
+class _BatchConflict(Exception):
+    """Internal control-flow signal used to abort a versioned bulk update
+    before identifying the conflicting rows."""
+    def __init__(self, batch):
+        self.batch = batch
 
 
 class ExceptionWrapper(object):
@@ -7942,6 +7961,123 @@ class Model(Node, metaclass=ModelBase):
             n += (cls.update(update)
                   .where(cls._meta.primary_key.in_(id_list))
                   .execute())
+        return n
+
+    @classmethod
+    def bulk_update_with_version(cls, model_list, fields, version,
+                                 batch_size=None):
+        """Optimistic-concurrency bulk update.
+
+        Each row is only updated when the ``version`` column in the database
+        still equals the value held by the corresponding model instance. On
+        success the version is incremented by one. If any row was deleted or
+        its version changed, the whole call is rolled back and an
+        :py:class:`OptimisticConcurrencyError` is raised, carrying the
+        conflicting primary keys in its ``conflicts`` attribute.
+        """
+        meta = cls._meta
+        if isinstance(meta.primary_key, CompositeKey):
+            raise ValueError('bulk_update_with_version() is not supported '
+                             'for models with a composite primary key.')
+        pk = meta.primary_key
+
+        # Normalize the version field and ensure it is a model integer field.
+        if isinstance(version, str):
+            version_name = version
+            version = meta.fields.get(version_name)
+            if version is None:
+                raise ValueError('Unknown version field: "%s".'
+                                 % version_name)
+        if not isinstance(version, IntegerField) or \
+                version is not meta.fields.get(version.name):
+            raise ValueError('version must be an IntegerField defined on '
+                             '%s.' % cls.__name__)
+        if version is pk:
+            raise ValueError('The primary key cannot be used as the version '
+                             'field.')
+
+        # Normalize list of fields so all are field instances, and make sure
+        # neither the primary key nor the version field are updated directly.
+        fields = [meta.fields[f] if isinstance(f, str) else f
+                  for f in fields]
+        for field in fields:
+            if field is pk:
+                raise ValueError('The primary key cannot be updated with '
+                                 'bulk_update_with_version().')
+            if field is version:
+                raise ValueError('The version field is managed automatically '
+                                 'and cannot be included in fields.')
+        attrs = [field.safe_name for field in fields]
+
+        model_list = list(model_list)
+        if not model_list:
+            return 0
+
+        # All instances must be saved and may not share a primary key.
+        seen = set()
+        for model in model_list:
+            obj_id = model._pk
+            if obj_id is None:
+                raise ValueError('bulk_update_with_version() requires saved '
+                                 'model instances with a primary key.')
+            if obj_id in seen:
+                raise ValueError('Duplicate primary key in model list: %r.'
+                                 % (obj_id,))
+            seen.add(obj_id)
+
+        if batch_size is not None:
+            batches = chunked(model_list, batch_size)
+        else:
+            batches = [model_list]
+
+        n = 0
+        version_attr = version.safe_name
+        try:
+            with meta.database.atomic():
+                for batch in batches:
+                    update = {}
+                    for field, attr in zip(fields, attrs):
+                        accum = []
+                        for model in batch:
+                            value = getattr(model, attr)
+                            if not isinstance(value, Node):
+                                value = field.case_value(value)
+                            accum.append((pk.to_value(model._pk), value))
+                        update[field] = Case(pk, accum)
+
+                    # Increment the version, guarding each row on the version
+                    # the corresponding instance was read with.
+                    update[version] = version + 1
+                    where = None
+                    for model in batch:
+                        clause = (pk == model._pk) & \
+                                 (version == getattr(model, version_attr))
+                        where = clause if where is None else where | clause
+
+                    count = cls.update(update).where(where).execute()
+                    if count != len(batch):
+                        raise _BatchConflict(batch)
+                    n += count
+        except _BatchConflict as exc:
+            # The transaction was rolled back, so the database again holds
+            # the versions we compared against. Identify the rows that were
+            # deleted or modified elsewhere.
+            batch = exc.batch
+            id_list = [model._pk for model in batch]
+            current = dict(cls.select(pk, version)
+                           .where(pk.in_(id_list)).tuples())
+            conflicts = [model._pk for model in batch
+                         if current.get(model._pk) !=
+                         getattr(model, version_attr)]
+            raise OptimisticConcurrencyError(cls, conflicts)
+
+        # Only after the transaction commits do we update the in-memory
+        # instances, so a rollback leaves the caller's objects untouched.
+        updated_names = set(field.name for field in fields)
+        updated_names.add(version.name)
+        for model in model_list:
+            model.__data__[version.name] += 1
+            model._dirty -= updated_names
         return n
 
     @classmethod
