@@ -1710,6 +1710,87 @@ class IntegrationTests(object):
         with self.assertRaises(ValueError):
             self.db.after_commit(coro_cb)
 
+    async def test_after_commit_savepoint_rollback(self):
+        acc = []
+        def outer():
+            with self.db.atomic():
+                TestModel.create(name='outer')
+                self.db.after_commit(lambda: acc.append('outer'))
+                try:
+                    with self.db.atomic():
+                        TestModel.create(name='inner')
+                        self.db.after_commit(lambda: acc.append('inner'))
+                        raise ValueError('inner')
+                except ValueError:
+                    pass
+                self.assertEqual(acc, [])
+        await self.db.run(outer)
+        # The rolled-back savepoint's row and callback are gone.
+        self.assertEqual(acc, ['outer'])
+        await self.assertNames(['outer'])
+
+    async def test_after_commit_three_levels(self):
+        if self.driver == 'postgresql':
+            self.skipTest('asyncpg atomic has no savepoint callback scopes')
+        acc = []
+        async with self.db.atomic():
+            await self.create_record('l1', 1)
+            self.db.after_commit(lambda: acc.append(1))
+            try:
+                async with self.db.atomic():
+                    await self.create_record('l2', 2)
+                    self.db.after_commit(lambda: acc.append(2))
+                    async with self.db.atomic():
+                        await self.create_record('l3', 3)
+                        self.db.after_commit(lambda: acc.append(3))
+                    # Releasing the savepoint must not run callbacks early.
+                    self.assertEqual(acc, [])
+                    self.db.after_commit(lambda: acc.append(4))
+                    raise ValueError('middle')
+            except ValueError:
+                pass
+            self.db.after_commit(lambda: acc.append(5))
+        self.assertEqual(acc, [1, 5])
+        await self.assertNames(['l1'])
+
+    async def test_after_commit_explicit_savepoint(self):
+        if self.driver == 'postgresql':
+            self.skipTest('asyncpg atomic has no savepoint callback scopes')
+        acc = []
+        def outer():
+            with self.db.atomic():
+                self.db.after_commit(lambda: acc.append('a'))
+                with self.db.savepoint() as sp:
+                    TestModel.create(name='s1')
+                    self.db.after_commit(lambda: acc.append('b'))
+                    sp.rollback()
+                    # New segment after the explicit rollback.
+                    TestModel.create(name='s2')
+                    self.db.after_commit(lambda: acc.append('c'))
+                    sp.commit()
+                    self.db.after_commit(lambda: acc.append('d'))
+        await self.db.run(outer)
+        self.assertEqual(acc, ['a', 'c', 'd'])
+        await self.assertNames(['s2'])
+
+    async def test_after_commit_callback_error(self):
+        def boom():
+            raise RuntimeError('callback failed')
+        def outer():
+            with self.db.atomic():
+                TestModel.create(name='kept')
+                self.db.after_commit(boom)
+        with self.assertRaises(RuntimeError):
+            await self.db.run(outer)
+        # The commit succeeded; the callback error is not a rollback.
+        await self.assertNames(['kept'])
+
+        # The failed callback leaves no residue for the next transaction.
+        acc = []
+        async with self.db.atomic():
+            self.db.after_commit(lambda: acc.append(1))
+        self.assertEqual(acc, [1])
+
     async def test_nested_transactions(self):
         def nested():
             with self.db.atomic():

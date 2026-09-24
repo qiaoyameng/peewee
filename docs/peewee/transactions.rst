@@ -172,9 +172,10 @@ enqueueing work keyed on a new row's id.
        order = Order.create(...)
        db.after_commit(lambda: process_order(order.id))
 
-Callbacks run in registration order after the outermost block commits.
-Savepoints get no special treatment, so a callback registered in a nested block
-whose savepoint rolls back still runs if the outer transaction commits. An
+Callbacks run exactly once, in registration order, after the outermost block
+commits. Each callback is scoped to the transaction or savepoint it was
+registered in: rolling back a savepoint discards the callbacks registered
+inside it, while releasing one merges them into the enclosing scope. An
 exception from a callback propagates, and later callbacks do not run. Not
 available in manual-commit mode, where peewee does not control the commit.
 

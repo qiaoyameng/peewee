@@ -4081,13 +4081,30 @@ class Database(_callable_context_manager):
         if self.transaction_depth() == 0:
             fn()
         else:
-            self._state.commit_callbacks.append(fn)
+            callbacks = self._state.commit_callbacks
+            if not callbacks:
+                callbacks.append([])
+            callbacks[-1].append(fn)
         return fn
+
+    def _push_commit_callbacks(self):
+        self._state.commit_callbacks.append([])
+
+    def _pop_commit_callbacks(self, merge):
+        try:
+            callbacks = self._state.commit_callbacks.pop()
+        except IndexError:
+            return
+        if merge:
+            if not self._state.commit_callbacks:
+                self._state.commit_callbacks.append([])
+            self._state.commit_callbacks[-1].extend(callbacks)
 
     def _run_commit_callbacks(self):
         callbacks = self._state.commit_callbacks
         if callbacks:
-            todo, callbacks[:] = list(callbacks), []
+            todo = [fn for scope in callbacks for fn in scope]
+            del callbacks[:]
             for fn in todo:
                 fn()
 
@@ -5325,16 +5342,19 @@ class _transaction(_callable_context_manager):
         self.db._run_commit_callbacks()
         if begin:
             self._begin()
+            self.db._push_commit_callbacks()
 
     def rollback(self, begin=True):
         self.db.rollback()
         self.db._clear_commit_callbacks()
         if begin:
             self._begin()
+            self.db._push_commit_callbacks()
 
     def __enter__(self):
         if self.db.transaction_depth() == 0:
             self._begin()
+            self.db._push_commit_callbacks()
         self.db.push_transaction(self)
         return self
 
@@ -5345,10 +5365,13 @@ class _transaction(_callable_context_manager):
             self.rollback(False)
         elif depth == 1:
             try:
-                self.commit(False)
+                self.db.commit()
             except Exception:
                 self.rollback(False)
                 raise
+            # Callback errors propagate after the commit has succeeded; the
+            # transaction must not be rolled back at this point.
+            self.db._run_commit_callbacks()
 
 
 class _savepoint(_callable_context_manager):
@@ -5365,14 +5388,21 @@ class _savepoint(_callable_context_manager):
 
     def commit(self, begin=True):
         self.db.execute_sql('RELEASE SAVEPOINT %s;' % self.quoted_sid)
-        if begin: self._begin()
+        self.db._pop_commit_callbacks(merge=True)
+        if begin:
+            self._begin()
+            self.db._push_commit_callbacks()
 
     def rollback(self, begin=True):
         self.db.execute_sql('ROLLBACK TO SAVEPOINT %s;' % self.quoted_sid)
-        if begin: self._begin()
+        self.db._pop_commit_callbacks(merge=False)
+        if begin:
+            self._begin()
+            self.db._push_commit_callbacks()
 
     def __enter__(self):
         self._begin()
+        self.db._push_commit_callbacks()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

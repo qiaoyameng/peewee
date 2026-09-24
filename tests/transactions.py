@@ -6,6 +6,7 @@ Most test cases use the Register model (a single IntegerField) from
 base_models, via BaseTransactionTestCase.
 """
 import threading
+from unittest.mock import patch
 
 from peewee import *
 
@@ -466,13 +467,136 @@ class TestAfterCommit(BaseTransactionTestCase):
                 db.after_commit(self.hook(2))
             try:
                 with db.atomic():
+                    self._save(3)
                     db.after_commit(self.hook(3))
                     raise ValueError('sp')
             except ValueError:
                 pass
             self.assertEqual(self.accum, [])
-        # No savepoint granularity: 3 runs though its savepoint rolled back.
-        self.assertEqual(self.accum, [1, 2, 3])
+        # Callbacks registered in the rolled-back savepoint are discarded.
+        self.assertEqual(self.accum, [1, 2])
+        self.assertRegister([])
+
+    @requires_nested
+    def test_after_commit_savepoint_rollback(self):
+        with db.atomic():
+            self._save(1)
+            db.after_commit(self.hook(1))
+            try:
+                with db.atomic():
+                    self._save(2)
+                    db.after_commit(self.hook(2))
+                    raise ValueError('inner')
+            except ValueError:
+                pass
+            self._save(3)
+            db.after_commit(self.hook(3))
+            self.assertEqual(self.accum, [])
+        # Inner savepoint rolled back: its row and callback are gone, the
+        # surviving callbacks run once, in registration order.
+        self.assertEqual(self.accum, [1, 3])
+        self.assertRegister([1, 3])
+
+    @requires_nested
+    def test_after_commit_three_levels(self):
+        with db.atomic():
+            self._save(1)
+            db.after_commit(self.hook(1))
+            try:
+                with db.atomic():
+                    self._save(2)
+                    db.after_commit(self.hook(2))
+                    with db.atomic():
+                        self._save(3)
+                        db.after_commit(self.hook(3))
+                    # Releasing the inner savepoint must not run callbacks.
+                    self.assertEqual(self.accum, [])
+                    db.after_commit(self.hook(4))
+                    raise ValueError('middle')
+            except ValueError:
+                pass
+            db.after_commit(self.hook(5))
+        # Middle savepoint (and everything nested in it) was discarded.
+        self.assertEqual(self.accum, [1, 5])
+        self.assertRegister([1])
+
+    @requires_nested
+    def test_after_commit_savepoint_explicit(self):
+        with db.atomic():
+            db.after_commit(self.hook(1))
+            with db.savepoint() as sp:
+                self._save(1)
+                db.after_commit(self.hook(2))
+                sp.rollback()
+                # A new segment begins after the explicit rollback.
+                self._save(2)
+                db.after_commit(self.hook(3))
+                sp.commit()
+                # Released segment merged into the outer transaction.
+                db.after_commit(self.hook(4))
+            self.assertEqual(self.accum, [])
+        self.assertEqual(self.accum, [1, 3, 4])
+        self.assertRegister([2])
+
+    @requires_nested
+    def test_after_commit_outer_rollback(self):
+        try:
+            with db.atomic():
+                db.after_commit(self.hook(1))
+                with db.atomic():
+                    db.after_commit(self.hook(2))
+                raise ValueError('outer')
+        except ValueError:
+            pass
+        self.assertEqual(self.accum, [])
+
+        # Nothing leaks into the next transaction.
+        with db.atomic():
+            db.after_commit(self.hook(3))
+        self.assertEqual(self.accum, [3])
+
+    def test_after_commit_commit_failure(self):
+        def failing_commit():
+            raise InterfaceError('commit failed')
+
+        with self.assertRaises(InterfaceError):
+            with patch.object(db, 'commit', failing_commit):
+                with db.atomic():
+                    self._save(1)
+                    db.after_commit(self.hook(1))
+        # Commit failed: the callback was discarded along with the data.
+        self.assertEqual(self.accum, [])
+        self.assertRegister([])
+
+        # The failed transaction leaves no residue behind.
+        with db.atomic():
+            self._save(2)
+            db.after_commit(self.hook(2))
+        self.assertEqual(self.accum, [2])
+        self.assertRegister([2])
+
+    def test_after_commit_callback_error(self):
+        def boom():
+            raise RuntimeError('callback failed')
+
+        with self.assertRaises(RuntimeError):
+            with db.atomic():
+                self._save(1)
+                db.after_commit(self.hook(1))
+                db.after_commit(boom)
+                db.after_commit(self.hook(2))
+        # The commit already succeeded; the error is not reinterpreted as a
+        # rollback, and remaining callbacks keep the existing policy of not
+        # running after a failure.
+        self.assertEqual(self.accum, [1])
+        self.assertRegister([1])
+
+        # The failed callback is not retried by the next transaction.
+        with db.atomic():
+            self._save(2)
+            db.after_commit(self.hook(3))
+        self.assertEqual(self.accum, [1, 3])
+        self.assertRegister([1, 2])
 
     def test_after_commit_reentrant(self):
         with db.atomic():
