@@ -319,7 +319,7 @@ class SqliteQueueDatabase(SqliteDatabase):
 
     def __unsupported__(self, *args, **kwargs):
         raise ValueError('This method is not supported by %r.' % type(self))
-    atomic = transaction = savepoint = __unsupported__
+    atomic = transaction = savepoint = run_in_transaction = __unsupported__
 
 
 class ThreadHelper(object):

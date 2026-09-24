@@ -1185,6 +1185,39 @@ Database
       Create a transaction context-manager / decorator, optionally using the
       specified locking strategy (default DEFERRED).
 
+   .. method:: run_in_transaction(callback, max_attempts=5, backoff=None)
+
+      :param callable callback: Zero-argument callable containing the business
+          logic to run in a transaction. It may be executed more than once,
+          so it must not perform external side-effects that cannot safely be
+          replayed.
+      :param int max_attempts: Maximum number of times the callback may run,
+          including the first attempt. Must be >= 1.
+      :param backoff: Optional iterable of non-negative delays (in seconds).
+          One delay is consumed before each retry; when the iterable is
+          exhausted, no further retries are made and the last error is
+          re-raised. The default (``None``) retries without sleeping.
+      :return: The value returned by the successful callback invocation.
+
+      Run ``callback()`` inside a transaction, retrying the *entire* callback
+      when SQLite reports lock contention. Only errors whose underlying
+      SQLite result code is ``SQLITE_BUSY`` or ``SQLITE_LOCKED`` (including
+      their extended result codes) are retried, and only after the failed
+      attempt has been confirmed rolled back. Constraint violations,
+      exceptions raised by the callback itself, cancellation exceptions,
+      connection failures, and errors for which rollback cannot be confirmed
+      all propagate immediately.
+
+      Cannot be called inside an existing transaction or a
+      :meth:`~Database.manual_commit` block.
+
+      :py:meth:`~Database.after_commit` callbacks registered by failed
+      attempts are discarded; only the successfully-committed attempt's
+      callbacks run. An error raised by an ``after_commit()`` callback never
+      causes the transaction to be replayed.
+
+      .. seealso:: :ref:`sqlite-run-in-transaction`
+
 
 .. class:: PostgresqlDatabase(database, register_unicode=True, encoding=None, isolation_level=None, prefer_psycopg3=False)
 

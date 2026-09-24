@@ -379,6 +379,52 @@ documentation.
    object. Peewee requires the ``sqlite3`` driver be in autocommit-mode, which
    is handled automatically by :class:`SqliteDatabase`.
 
+.. _sqlite-run-in-transaction:
+
+Retrying Transactions on Lock Contention
+----------------------------------------
+
+When a short transaction fails because another connection holds a lock
+(``SQLITE_BUSY`` or ``SQLITE_LOCKED``),
+:meth:`SqliteDatabase.run_in_transaction` re-executes the *entire* business
+callback in a fresh transaction:
+
+.. code-block:: python
+
+    db = SqliteDatabase('app.db')
+
+    def place_order():
+        Order.create(customer=customer, total=total)
+        update_inventory()
+
+    # Up to 3 attempts, waiting 50ms and then 200ms before retries.
+    db.run_in_transaction(place_order, max_attempts=3, backoff=[0.05, 0.2])
+
+Semantics:
+
+* ``max_attempts`` includes the first attempt, so retries are always bounded.
+* ``backoff`` is an iterable of non-negative delays (in seconds). One delay
+  is consumed before each retry; if the iterable is exhausted, no further
+  retries are made and the last error is re-raised. The default (``None``)
+  retries without sleeping.
+* Only errors whose underlying SQLite result code is ``SQLITE_BUSY`` or
+  ``SQLITE_LOCKED`` (including extended result codes) are retried, and only
+  after the failed attempt has been confirmed rolled back. Constraint
+  violations, exceptions raised by the callback itself, cancellation
+  exceptions and connection failures all propagate immediately.
+* ``run_in_transaction()`` cannot be called inside an existing transaction
+  or a ``manual_commit()`` block, since replaying code the caller did not
+  authorize for replay would be unsafe.
+* :py:meth:`~Database.after_commit` callbacks registered by failed attempts
+  are discarded; only the successfully-committed attempt's callbacks run. An
+  error raised by an ``after_commit()`` callback never causes the business
+  transaction to be replayed.
+
+.. warning::
+   The callback may be executed multiple times. Do not perform external,
+   non-replayable side-effects (sending email, charging a card, calling web
+   APIs, etc.) inside the callback.
+
 
 .. _cysqlite-ext:
 
@@ -2638,4 +2684,3 @@ Available functions
    SequenceMatcher's algorithm.
 
    .. note:: Only available if you compiled the ``_sqlite_udf`` extension.
-

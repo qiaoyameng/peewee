@@ -4204,6 +4204,27 @@ def __pragma__(name):
     return property(__get__, __set__)
 
 
+# Primary SQLite result codes indicating lock contention. Extended result
+# codes (e.g. SQLITE_BUSY_SNAPSHOT, SQLITE_LOCKED_SHAREDCACHE) share the low
+# byte with their primary code, so masking with 0xFF recovers the primary
+# code. Defined as literals because the sqlite3 module only exposes these
+# constants on Python 3.11+.
+SQLITE_BUSY = 5
+SQLITE_LOCKED = 6
+
+
+def _is_sqlite_lock_error(exc):
+    # Unwrap the original DB-API exception if peewee wrapped it, then check
+    # the SQLite error code reported by the driver. The exception message is
+    # deliberately never consulted. If the driver did not report a code we
+    # cannot confirm lock contention, so the error is not retryable.
+    orig = getattr(exc, 'orig', None) or exc
+    code = getattr(orig, 'sqlite_errorcode', None)
+    if code is None:
+        return False
+    return (code & 0xFF) in (SQLITE_BUSY, SQLITE_LOCKED)
+
+
 class SqliteDatabase(Database):
     field_types = {
         'BIGAUTO': FIELD.AUTO,
@@ -4463,6 +4484,96 @@ class SqliteDatabase(Database):
         statement = 'BEGIN %s' % lock_type if lock_type else 'BEGIN'
         with __exception_wrapper__:
             self.cursor().execute(statement)
+
+    def run_in_transaction(self, callback, max_attempts=5, backoff=None):
+        """
+        Run ``callback()`` inside a transaction, retrying the *entire*
+        callback when SQLite reports lock contention (SQLITE_BUSY or
+        SQLITE_LOCKED, including their extended result codes).
+
+        :param callable callback: Zero-argument callable containing the
+            business logic to run transactionally. It may be executed more
+            than once, so it must not perform external side-effects that
+            cannot safely be replayed.
+        :param int max_attempts: Maximum number of times the callback may be
+            executed, including the first attempt. Must be >= 1.
+        :param backoff: Optional iterable of non-negative delays (seconds).
+            One delay is consumed before each retry; when the iterable is
+            exhausted, no further retries are made and the last error is
+            re-raised. ``None`` (the default) retries without sleeping.
+        :return: The value returned by the successful callback invocation.
+
+        Only errors whose underlying SQLite result code is SQLITE_BUSY or
+        SQLITE_LOCKED are retried, and only after the failed attempt has been
+        confirmed rolled back. Constraint violations, exceptions raised by
+        the callback itself, cancellation exceptions, connection failures
+        and errors for which rollback cannot be confirmed all propagate
+        immediately. ``after_commit()`` callbacks registered by failed
+        attempts are discarded; only the final, successfully-committed
+        attempt's callbacks run, and an error raised by an ``after_commit()``
+        callback never causes the transaction to be replayed.
+
+        This cannot be called inside an existing transaction or a
+        ``manual_commit()`` block.
+        """
+        if self.transaction_depth() > 0:
+            raise ValueError('run_in_transaction() cannot be called from '
+                             'within a transaction or manual-commit block.')
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int)\
+                or max_attempts < 1:
+            raise ValueError('max_attempts must be a positive integer.')
+
+        delays = iter(backoff) if backoff is not None else None
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = self._run_transaction_attempt(callback)
+            except Exception as exc:
+                if attempt >= max_attempts or not _is_sqlite_lock_error(exc):
+                    raise
+                delay = 0
+                if delays is not None:
+                    try:
+                        delay = next(delays)
+                    except StopIteration:
+                        # Backoff exhausted: no further retries, re-raise the
+                        # original lock error.
+                        raise exc
+                    if isinstance(delay, bool) \
+                            or not isinstance(delay, (int, float)) \
+                            or delay < 0:
+                        raise ValueError('backoff delays must be non-negative '
+                                         'numbers.')
+                if delay:
+                    time.sleep(delay)
+            else:
+                break
+
+        # The transaction committed successfully. Run the commit callbacks
+        # outside the retry loop: a failure here must never replay the
+        # business transaction.
+        self._run_commit_callbacks()
+        return result
+
+    def _run_transaction_attempt(self, callback):
+        txn = _transaction(self)
+        txn.__enter__()  # If BEGIN itself fails, no transaction was opened.
+        try:
+            result = callback()
+        except BaseException:
+            self.pop_transaction()
+            txn.rollback(False)  # Also discards after_commit() callbacks.
+            raise
+        self.pop_transaction()
+        try:
+            self.commit()
+        except Exception:
+            # If the rollback fails we cannot confirm the attempt was rolled
+            # back, so the rollback error propagates and no retry occurs.
+            txn.rollback(False)
+            raise
+        return result
 
     def get_tables(self, schema=None):
         schema = qesc(schema or 'main')

@@ -1,8 +1,14 @@
 from decimal import Decimal as D
 import datetime
 import json
+import os
+import sqlite3
+import tempfile
+import threading
+from contextlib import contextmanager
 
 from peewee import *
+import peewee
 from playhouse.sqlite_ext import *
 
 from .base import BaseTestCase
@@ -1734,3 +1740,264 @@ class TestISODateTimeField(ModelTestCase):
 
         query = DT.select().where(DT.iso >= '2026-01-01')
         self.assertEqual([d.key for d in query], ['k2'])
+
+
+class TestRunInTransaction(BaseTestCase):
+    def setUp(self):
+        super(TestRunInTransaction, self).setUp()
+        fd, self.filename = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        # timeout=0 so lock contention raises SQLITE_BUSY immediately.
+        self.db = SqliteDatabase(self.filename, timeout=0)
+
+        class Note(Model):
+            text = TextField(unique=True)
+            class Meta:
+                database = self.db
+                table_name = 'note'
+
+        self.Note = Note
+        self.db.create_tables([Note])
+
+    def tearDown(self):
+        self.db.close()
+        os.unlink(self.filename)
+        super(TestRunInTransaction, self).tearDown()
+
+    @contextmanager
+    def write_lock_held(self):
+        # Hold an EXCLUSIVE lock on the database file from a second
+        # connection for the duration of the with-block.
+        lock_held = threading.Barrier(2)
+        release = threading.Event()
+
+        def blocker():
+            conn = sqlite3.connect(self.filename, isolation_level=None)
+            conn.execute('BEGIN EXCLUSIVE')
+            lock_held.wait(10)
+            release.wait(10)
+            conn.execute('COMMIT')
+            conn.close()
+
+        thread = threading.Thread(target=blocker)
+        thread.start()
+        lock_held.wait(10)  # The write lock is held from this point on.
+        try:
+            yield
+        finally:
+            release.set()
+            thread.join(10)
+
+    def note_texts(self):
+        return [note.text for note in self.Note.select()]
+
+    def test_retry_after_lock_released(self):
+        # Two connections rendezvous via barriers: the blocker holds an
+        # EXCLUSIVE lock, the first attempt fails with SQLITE_BUSY, then the
+        # lock is released and the retry succeeds.
+        lock_held = threading.Barrier(2)
+        attempt_failed = threading.Barrier(2)
+        lock_released = threading.Barrier(2)
+
+        def blocker():
+            conn = sqlite3.connect(self.filename, isolation_level=None)
+            conn.execute('BEGIN EXCLUSIVE')
+            lock_held.wait(10)
+            attempt_failed.wait(10)  # Wait for the first attempt to fail.
+            conn.execute('COMMIT')
+            conn.close()
+            lock_released.wait(10)
+
+        def backoff():
+            attempt_failed.wait(10)  # Signal that attempt 1 was rolled back.
+            lock_released.wait(10)   # Wait for the lock to be released.
+            yield 0
+
+        calls = []
+        commits = []
+
+        def callback():
+            calls.append(1)
+            self.db.after_commit(lambda: commits.append(1))
+            return self.Note.create(text='hello').id
+
+        thread = threading.Thread(target=blocker)
+        thread.start()
+        lock_held.wait(10)  # The write lock is now held by the blocker.
+        result = self.db.run_in_transaction(
+            callback, max_attempts=3, backoff=backoff())
+        thread.join(10)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 2)  # Callback ran once per attempt.
+        # The failed attempt's after_commit() callback was discarded; only
+        # the committed attempt's callback ran.
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(self.note_texts(), ['hello'])
+        self.assertFalse(self.db.in_transaction())
+
+    def test_attempts_exhausted(self):
+        calls = []
+
+        def callback():
+            calls.append(1)
+            self.Note.create(text='x')
+
+        with self.write_lock_held():
+            try:
+                self.db.run_in_transaction(callback, max_attempts=3,
+                                           backoff=[0, 0])
+            except OperationalError as exc:
+                err = exc
+            else:
+                self.fail('expected OperationalError')
+
+        self.assertEqual(len(calls), 3)  # max_attempts includes the first.
+        # The error is the driver's lock-contention error, not a text match.
+        if hasattr(err.orig, 'sqlite_errorcode'):
+            self.assertEqual(err.orig.sqlite_errorcode & 0xFF, 5)
+        self.assertEqual(self.note_texts(), [])  # Everything rolled back.
+        self.assertFalse(self.db.in_transaction())
+
+    def test_backoff_exhausted_stops_retrying(self):
+        calls = []
+
+        def callback():
+            calls.append(1)
+            self.Note.create(text='x')
+
+        with self.write_lock_held():
+            # Empty backoff: no retry is permitted at all.
+            with self.assertRaisesCtx(OperationalError):
+                self.db.run_in_transaction(callback, max_attempts=5,
+                                           backoff=[])
+            self.assertEqual(len(calls), 1)
+
+            # A single delay allows exactly one retry.
+            del calls[:]
+            with self.assertRaisesCtx(OperationalError):
+                self.db.run_in_transaction(callback, max_attempts=5,
+                                           backoff=[0])
+            self.assertEqual(len(calls), 2)
+
+    def test_integrity_error_not_retried(self):
+        self.Note.create(text='dup')
+        calls = []
+
+        def callback():
+            calls.append(1)
+            self.Note.create(text='dup')
+
+        with self.assertRaisesCtx(IntegrityError):
+            self.db.run_in_transaction(callback, max_attempts=3,
+                                       backoff=[0, 0])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.note_texts(), ['dup'])
+
+    def test_callback_exception_not_retried(self):
+        calls = []
+
+        def callback():
+            calls.append(1)
+            raise ValueError('boom')
+
+        with self.assertRaisesCtx(ValueError):
+            self.db.run_in_transaction(callback, max_attempts=3)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.db.in_transaction())
+
+    def test_cancellation_not_retried(self):
+        calls = []
+
+        def callback():
+            calls.append(1)
+            raise KeyboardInterrupt()
+
+        self.assertRaises(KeyboardInterrupt, self.db.run_in_transaction,
+                          callback, 3)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.db.in_transaction())
+
+    def test_after_commit_failure_not_replayed(self):
+        calls = []
+        commits = []
+
+        def bad_commit_callback():
+            commits.append(1)
+            raise RuntimeError('after-commit failure')
+
+        def callback():
+            calls.append(1)
+            self.db.after_commit(bad_commit_callback)
+            self.Note.create(text='x')
+
+        with self.assertRaisesCtx(RuntimeError):
+            self.db.run_in_transaction(callback, max_attempts=3,
+                                       backoff=[0, 0])
+        # The transaction committed; the after-commit error must not cause
+        # the business callback to be replayed.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(self.note_texts(), ['x'])
+
+    def test_disallowed_inside_transaction(self):
+        with self.db.atomic():
+            with self.assertRaisesCtx(ValueError):
+                self.db.run_in_transaction(lambda: None)
+        with self.db.manual_commit():
+            with self.assertRaisesCtx(ValueError):
+                self.db.run_in_transaction(lambda: None)
+
+    def test_invalid_arguments(self):
+        for bad in (0, -1, 1.5, '3', True):
+            with self.assertRaisesCtx(ValueError):
+                self.db.run_in_transaction(lambda: None, max_attempts=bad)
+
+    def test_negative_backoff_delay(self):
+        calls = []
+
+        def callback():
+            calls.append(1)
+            self.Note.create(text='x')
+
+        with self.write_lock_held():
+            with self.assertRaisesCtx(ValueError):
+                self.db.run_in_transaction(callback, max_attempts=3,
+                                           backoff=[-1])
+        self.assertEqual(len(calls), 1)
+
+    def test_success_first_attempt(self):
+        commits = []
+
+        def callback():
+            self.db.after_commit(lambda: commits.append(1))
+            self.Note.create(text='x')
+            return 42
+
+        self.assertEqual(self.db.run_in_transaction(callback), 42)
+        self.assertEqual(len(commits), 1)
+        self.assertEqual(self.note_texts(), ['x'])
+        self.assertFalse(self.db.in_transaction())
+
+    def test_lock_error_classification(self):
+        is_lock_error = peewee._is_sqlite_lock_error
+
+        def make_error(code, message='database is locked'):
+            err = sqlite3.OperationalError(message)
+            err.sqlite_errorcode = code
+            return err
+
+        # Primary codes and their extended codes are retryable, whether or
+        # not peewee wrapped the driver's exception.
+        for code in (5, 6, 5 | (2 << 8), 6 | (1 << 8)):
+            self.assertTrue(is_lock_error(make_error(code)))
+            self.assertTrue(is_lock_error(OperationalError(make_error(code))))
+
+        # Other codes are not retried, even with a lock-sounding message.
+        for code in (1, 19, 19 | (6 << 8), 8 | (3 << 8)):
+            self.assertFalse(is_lock_error(make_error(code)))
+
+        # No error code reported by the driver: cannot confirm lock
+        # contention, so the error is not retryable.
+        self.assertFalse(is_lock_error(
+            sqlite3.OperationalError('database is locked')))

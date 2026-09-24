@@ -9,6 +9,14 @@ https://github.com/coleifer/peewee/releases
 
 [View commits](https://github.com/coleifer/peewee/compare/4.5.1...master)
 
+* Add `SqliteDatabase.run_in_transaction(callback, max_attempts, backoff)`,
+  which re-executes the entire callback when SQLite reports lock contention
+  (`SQLITE_BUSY` / `SQLITE_LOCKED`, including extended result codes). Only
+  errors confirmed rolled back are retried; retries are bounded by
+  `max_attempts` (including the first attempt) and paced by the caller's
+  `backoff` delay sequence. Cannot be used inside an existing transaction or
+  `manual_commit()` block.
+
 ## 4.5.1
 
 * `EnumField` and `IntEnumField` validate member value types (`str` and
