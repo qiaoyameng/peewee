@@ -471,8 +471,136 @@ class TestAfterCommit(BaseTransactionTestCase):
             except ValueError:
                 pass
             self.assertEqual(self.accum, [])
-        # No savepoint granularity: 3 runs though its savepoint rolled back.
-        self.assertEqual(self.accum, [1, 2, 3])
+        # Savepoint granularity: 3's savepoint rolled back, so it is
+        # discarded. 1 and 2 run once, in order, at the outer commit.
+        self.assertEqual(self.accum, [1, 2])
+
+    @requires_nested
+    def test_after_commit_savepoint_rollback(self):
+        # Outer registers a callback, inner savepoint inserts a row and
+        # registers another, then rolls back. The inner row is gone and
+        # its callback must not run; the outer callback runs at commit.
+        with db.atomic():
+            db.after_commit(self.hook(1))
+            try:
+                with db.atomic():
+                    self._save(1)
+                    db.after_commit(self.hook(2))
+                    raise ValueError('sp')
+            except ValueError:
+                pass
+            self._save(2)
+            self.assertEqual(self.accum, [])
+        self.assertEqual(self.accum, [1])
+        self.assertRegister([2])
+
+    @requires_nested
+    def test_after_commit_three_levels(self):
+        with db.atomic():
+            db.after_commit(self.hook(1))
+            self._save(1)
+            try:
+                with db.atomic():
+                    db.after_commit(self.hook(2))
+                    self._save(2)
+                    with db.atomic():
+                        db.after_commit(self.hook(3))
+                        self._save(3)
+                    raise ValueError('sp2')
+            except ValueError:
+                pass
+            with db.atomic():
+                db.after_commit(self.hook(4))
+                self._save(4)
+            self.assertEqual(self.accum, [])
+        # Middle savepoint rolled back: 2 and 3 discarded along with
+        # their rows. 1 and 4 run once, in registration order.
+        self.assertEqual(self.accum, [1, 4])
+        self.assertRegister([1, 4])
+
+    @requires_nested
+    def test_after_commit_savepoint_explicit(self):
+        # Explicit rollback() re-begins the savepoint: callbacks
+        # registered afterwards belong to the new segment.
+        with db.atomic():
+            with db.savepoint() as sp:
+                db.after_commit(self.hook(1))
+                self._save(1)
+                sp.rollback()
+                db.after_commit(self.hook(2))
+                self._save(2)
+            self.assertEqual(self.accum, [])
+        self.assertEqual(self.accum, [2])
+        self.assertRegister([2])
+
+        self.accum = []
+
+        # Explicit commit() releases the savepoint: its callbacks now
+        # belong to the outer scope and survive a later rollback of the
+        # re-begun savepoint.
+        with db.atomic():
+            with db.savepoint() as sp:
+                db.after_commit(self.hook(3))
+                self._save(3)
+                sp.commit()
+                db.after_commit(self.hook(4))
+                self._save(4)
+                sp.rollback()
+                db.after_commit(self.hook(5))
+                self._save(5)
+            self.assertEqual(self.accum, [])
+        self.assertEqual(self.accum, [3, 5])
+        self.assertRegister([2, 3, 5])
+
+    def test_after_commit_callback_error(self):
+        def bad():
+            self.accum.append('bad')
+            raise ValueError('callback failed')
+
+        # A failing callback propagates, but the transaction was already
+        # committed - the row must not be reported as rolled back.
+        with self.assertRaises(ValueError):
+            with db.atomic():
+                self._save(1)
+                db.after_commit(bad)
+        self.assertEqual(self.accum, ['bad'])
+        self.assertRegister([1])
+
+        # No residual callbacks leak into the next transaction.
+        with db.atomic():
+            self._save(2)
+            db.after_commit(self.hook(2))
+        self.assertEqual(self.accum, ['bad', 2])
+        self.assertRegister([1, 2])
+
+    def test_after_commit_commit_failure(self):
+        # Force the database commit itself to fail: callbacks are
+        # discarded and do not resurface in later transactions.
+        class FailingCommit(object):
+            def __init__(self, db):
+                self.db = db
+                self.real_commit = db.commit
+            def __enter__(self):
+                def fail():
+                    raise OperationalError('commit failed')
+                self.db.commit = fail
+                return self
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.db.commit = self.real_commit
+
+        with FailingCommit(db):
+            with self.assertRaises(OperationalError):
+                with db.atomic():
+                    self._save(1)
+                    db.after_commit(self.hook(1))
+        self.assertEqual(self.accum, [])
+        self.assertRegister([])
+
+        with db.atomic():
+            self._save(2)
+            db.after_commit(self.hook(2))
+        self.assertEqual(self.accum, [2])
+        self.assertRegister([2])
 
     def test_after_commit_reentrant(self):
         with db.atomic():

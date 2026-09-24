@@ -1710,6 +1710,132 @@ class IntegrationTests(object):
         with self.assertRaises(ValueError):
             self.db.after_commit(coro_cb)
 
+    async def test_after_commit_savepoint_rollback(self):
+        # Callbacks registered inside a rolled-back savepoint are
+        # discarded along with its rows; the outer callback runs once.
+        acc = []
+        async with self.db.atomic():
+            self.db.after_commit(lambda: acc.append(1))
+            try:
+                async with self.db.atomic():
+                    await self.create_record('inner', 1)
+                    self.db.after_commit(lambda: acc.append(2))
+                    raise ValueError('sp')
+            except ValueError:
+                pass
+            await self.create_record('outer', 2)
+            self.assertEqual(acc, [])
+        self.assertEqual(acc, [1])
+        await self.assertCount(1)
+        await self.assertNames(['outer'])
+
+    async def test_after_commit_three_levels(self):
+        acc = []
+        async with self.db.atomic():
+            self.db.after_commit(lambda: acc.append(1))
+            await self.create_record('l1', 1)
+            try:
+                async with self.db.atomic():
+                    self.db.after_commit(lambda: acc.append(2))
+                    await self.create_record('l2', 2)
+                    async with self.db.atomic():
+                        self.db.after_commit(lambda: acc.append(3))
+                        await self.create_record('l3', 3)
+                    raise ValueError('sp2')
+            except ValueError:
+                pass
+            async with self.db.atomic():
+                self.db.after_commit(lambda: acc.append(4))
+                await self.create_record('l4', 4)
+            self.assertEqual(acc, [])
+        # Middle savepoint rolled back: 2 and 3 discarded with their
+        # rows. 1 and 4 run once, in registration order.
+        self.assertEqual(acc, [1, 4])
+        await self.assertNames(['l1', 'l4'])
+
+    async def test_after_commit_savepoint_explicit(self):
+        # Explicit rollback() re-begins the savepoint: callbacks
+        # registered afterwards belong to the new segment.
+        acc = []
+        async with self.db.atomic():
+            async with self.db.savepoint() as sp:
+                self.db.after_commit(lambda: acc.append(1))
+                await self.create_record('r1', 1)
+                await sp.arollback()
+                self.db.after_commit(lambda: acc.append(2))
+                await self.create_record('r2', 2)
+            self.assertEqual(acc, [])
+        self.assertEqual(acc, [2])
+        await self.assertNames(['r2'])
+
+        acc[:] = []
+
+        # Explicit commit() releases the savepoint: its callbacks now
+        # belong to the outer scope and survive a later rollback of the
+        # re-begun savepoint.
+        async with self.db.atomic():
+            async with self.db.savepoint() as sp:
+                self.db.after_commit(lambda: acc.append(3))
+                await self.create_record('r3', 3)
+                await sp.acommit()
+                self.db.after_commit(lambda: acc.append(4))
+                await self.create_record('r4', 4)
+                await sp.arollback()
+                self.db.after_commit(lambda: acc.append(5))
+                await self.create_record('r5', 5)
+            self.assertEqual(acc, [])
+        self.assertEqual(acc, [3, 5])
+        await self.assertNames(['r2', 'r3', 'r5'])
+
+    async def test_after_commit_callback_error(self):
+        acc = []
+        def bad():
+            acc.append('bad')
+            raise ValueError('callback failed')
+
+        # A failing callback propagates, but the transaction was already
+        # committed - the row must not be reported as rolled back.
+        with self.assertRaises(ValueError):
+            async with self.db.atomic():
+                await self.create_record('c1', 1)
+                self.db.after_commit(bad)
+        self.assertEqual(acc, ['bad'])
+        await self.assertCount(1)
+
+        # No residual callbacks leak into the next transaction.
+        async with self.db.atomic():
+            await self.create_record('c2', 2)
+            self.db.after_commit(lambda: acc.append(2))
+        self.assertEqual(acc, ['bad', 2])
+        await self.assertCount(2)
+
+    async def test_after_commit_commit_failure(self):
+        if self.driver == 'postgresql':
+            self.skipTest('AsyncPgAtomic commits via asyncpg, not db.commit')
+
+        # Force the database commit itself to fail: callbacks are
+        # discarded and do not resurface in later transactions.
+        acc = []
+        real_commit = self.db.commit
+        def fail_commit():
+            raise OperationalError('commit failed')
+        self.db.commit = fail_commit
+        try:
+            with self.assertRaises(OperationalError):
+                async with self.db.atomic():
+                    await self.create_record('f1', 1)
+                    self.db.after_commit(lambda: acc.append(1))
+        finally:
+            self.db.commit = real_commit
+        self.assertEqual(acc, [])
+        await self.assertCount(0)
+
+        async with self.db.atomic():
+            await self.create_record('f2', 2)
+            self.db.after_commit(lambda: acc.append(2))
+        self.assertEqual(acc, [2])
+        await self.assertCount(1)
+
     async def test_nested_transactions(self):
         def nested():
             with self.db.atomic():

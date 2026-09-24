@@ -1148,8 +1148,8 @@ class AsyncPgAtomic(_callable_context_manager):
         self.db._state.transactions.pop()
         outermost = not self.db._state.transactions
         if exc_type:
-            if outermost:
-                self.db._clear_commit_callbacks()
+            # Discard callbacks registered within the rolled-back scope.
+            del self.db._state.commit_callbacks[self._cb_start:]
             self.rollback(False)
         else:
             try:
@@ -1157,8 +1157,7 @@ class AsyncPgAtomic(_callable_context_manager):
             except Exception:
                 # asyncpg marks the transaction FAILED when commit errors,
                 # making rollback raise too - don't mask the original.
-                if outermost:
-                    self.db._clear_commit_callbacks()
+                del self.db._state.commit_callbacks[self._cb_start:]
                 try:
                     self.rollback(False)
                 except Exception:
@@ -1179,6 +1178,9 @@ class AsyncPgAtomic(_callable_context_manager):
         with __exception_wrapper__:
             self._tx = conn.conn.transaction(*a, **k)
             await self._tx.start()
+        # Callbacks registered from here on belong to this frame; a
+        # nested (savepoint) rollback discards only its own.
+        self._cb_start = len(self.db._state.commit_callbacks)
         return self._tx
 
     async def acommit(self, begin=True):
@@ -1190,6 +1192,8 @@ class AsyncPgAtomic(_callable_context_manager):
     async def arollback(self, begin=True):
         with __exception_wrapper__:
             await self._tx.rollback()
+        # Discard callbacks registered within the rolled-back scope.
+        del self.db._state.commit_callbacks[self._cb_start:]
         if begin:
             await self._abegin()
 

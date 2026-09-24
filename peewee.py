@@ -5322,9 +5322,9 @@ class _transaction(_callable_context_manager):
 
     def commit(self, begin=True):
         self.db.commit()
-        self.db._run_commit_callbacks()
         if begin:
             self._begin()
+        self.db._run_commit_callbacks()
 
     def rollback(self, begin=True):
         self.db.rollback()
@@ -5345,10 +5345,14 @@ class _transaction(_callable_context_manager):
             self.rollback(False)
         elif depth == 1:
             try:
-                self.commit(False)
+                self.db.commit()
             except Exception:
                 self.rollback(False)
                 raise
+            # The transaction is committed at this point. Callback errors
+            # must not be reinterpreted as a failed commit, so they are
+            # raised only after the database commit has succeeded.
+            self.db._run_commit_callbacks()
 
 
 class _savepoint(_callable_context_manager):
@@ -5356,19 +5360,26 @@ class _savepoint(_callable_context_manager):
         self.db = db
         self.sid = sid or 's' + uuid.uuid4().hex
         self.quoted_sid = self.sid.join(self.db.quote)
+        self._cb_start = 0
 
     def _build_ctx(self):
         return type(self)(self.db)  # Omit sid, each call gets its own.
 
     def _begin(self):
         self.db.execute_sql('SAVEPOINT %s;' % self.quoted_sid)
+        # Callbacks registered from here on belong to this savepoint.
+        self._cb_start = len(self.db._state.commit_callbacks)
 
     def commit(self, begin=True):
         self.db.execute_sql('RELEASE SAVEPOINT %s;' % self.quoted_sid)
+        # Released: callbacks now belong to the enclosing scope and run
+        # when the outer transaction commits.
         if begin: self._begin()
 
     def rollback(self, begin=True):
         self.db.execute_sql('ROLLBACK TO SAVEPOINT %s;' % self.quoted_sid)
+        # Discard callbacks registered within the rolled-back scope.
+        del self.db._state.commit_callbacks[self._cb_start:]
         if begin: self._begin()
 
     def __enter__(self):
