@@ -7,6 +7,13 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Add `CompositeForeignKeyField`, which declares a foreign-key relationship
+  over existing local fields (no additional column is created) targeting a
+  composite primary key or multi-column unique key. Supports multi-column
+  `FOREIGN KEY` constraints, lazy loading, assignment, back-references,
+  automatic joins (including aliases and self-references), `prefetch()` and
+  `with_related()`.
+
 [View commits](https://github.com/coleifer/peewee/compare/4.5.1...master)
 
 ## 4.5.1

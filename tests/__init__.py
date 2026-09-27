@@ -9,6 +9,8 @@ from peewee import OperationalError
 MODULES = []
 
 # Core modules.
+from . import composite_fk
+MODULES.append(composite_fk)
 from . import db_tests
 MODULES.append(db_tests)
 from . import fields

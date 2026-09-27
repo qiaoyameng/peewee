@@ -166,6 +166,114 @@ To retrieve the related object(s), select both sources and issue a
 .. seealso::
    :ref:`nplusone` explains when and why disabling lazy loading is useful.
 
+.. _composite-foreign-keys:
+
+Composite Foreign Keys
+----------------------
+
+Tables that use a :class:`CompositeKey` (or a multi-column unique key) can be
+referenced with a :class:`CompositeForeignKeyField`. Unlike
+:class:`ForeignKeyField`, a composite foreign key does **not** create any
+additional column: it is a relationship declared *on top of* existing local
+fields. The component fields store the key values, and Peewee emits a
+multi-column ``FOREIGN KEY`` constraint when the table is created.
+
+.. code-block:: python
+
+   class Document(BaseModel):
+       tenant_id = IntegerField()
+       document_no = TextField()
+       title = TextField()
+
+       class Meta:
+           primary_key = CompositeKey('tenant_id', 'document_no')
+
+   class LineItem(BaseModel):
+       tenant_id = IntegerField(null=True)
+       document_no = TextField(null=True)
+       qty = IntegerField(default=0)
+
+       # Relationship over the two existing fields above. No new column is
+       # created; "tenant_id" and "document_no" store the key values.
+       document = CompositeForeignKeyField(
+           Document,
+           fields=('tenant_id', 'document_no'),
+           backref='lines',
+           on_delete='CASCADE')
+
+The ``fields`` argument names the local component fields (which must be
+declared *before* the relation). By default the relation targets the related
+model's composite primary key; to target a multi-column unique key instead,
+pass ``rel_fields`` explicitly:
+
+.. code-block:: python
+
+   class Account(BaseModel):
+       k1 = IntegerField()
+       k2 = TextField()
+
+       class Meta:
+           indexes = ((('k1', 'k2'), True),)  # unique together
+
+   class Entry(BaseModel):
+       k1 = IntegerField(null=True)
+       k2 = TextField(null=True)
+       account = CompositeForeignKeyField(
+           Account, fields=('k1', 'k2'), rel_fields=('k1', 'k2'))
+
+At declaration time Peewee validates that the component fields exist, that
+the local and target field counts match, and that the target fields form the
+primary key or a unique index of the related model.
+
+Reading, assigning and joining
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A composite foreign key supports the same access patterns as a regular
+foreign key. Reads and grouping always use the *whole* key, so rows that
+share one component (e.g. the same ``document_no`` in different tenants)
+never resolve to the wrong object:
+
+.. code-block:: python
+
+   # Lazy loading: issues a SELECT on first access, then caches.
+   line = LineItem.get(LineItem.id == 1)
+   print(line.document.title)
+
+   # Assigning a saved instance populates all component fields.
+   line.document = Document.get(Document.tenant_id == 2,
+                                Document.document_no == 'A')
+   print(line.tenant_id, line.document_no)  # 2 'A'
+
+   # Back-reference: pre-filtered select of related rows.
+   for line in doc.lines:
+       print(line.qty)
+
+   # Automatic join across all key columns.
+   query = LineItem.select().join(Document).where(Document.title == 't1')
+
+   # Prefetch works in both directions.
+   docs = prefetch(Document.select(), LineItem)
+
+Model aliases and self-references (``CompositeForeignKeyField('self', ...)``)
+are supported, just like regular foreign keys.
+
+Null semantics
+^^^^^^^^^^^^^^
+
+The components of a composite foreign key are treated as a single unit:
+
+* If **every** component is ``None``, the relation is empty and accessing it
+  returns ``None`` (assigning ``None`` clears all components).
+* If **some but not all** components are ``None``, accessing or assigning the
+  relation raises :py:class:`ValueError` -- Peewee will not issue a lenient
+  query against a partial key.
+* Assigning an instance whose key is not fully populated (e.g. an unsaved
+  instance) also raises :py:class:`ValueError`.
+
+.. note::
+   Modifying any component field invalidates the cached related object: the
+   next access re-resolves the relation using the current key values.
+
 .. _backreferences:
 
 Back-references

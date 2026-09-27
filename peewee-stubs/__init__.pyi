@@ -1219,6 +1219,19 @@ class BackrefAccessor:
     def __init__(self, field) -> None: ...
     def __get__(self, instance, instance_type=None): ...
 
+class CompositeForeignKeyAccessor(FieldAccessor):
+    rel_model: Incomplete
+    def __init__(self, model, field, name) -> None: ...
+    def __get__(self, instance, instance_type=None): ...
+    def __set__(self, instance, obj) -> None: ...
+
+class CompositeBackrefAccessor:
+    field: Incomplete
+    model: Incomplete
+    rel_model: Incomplete
+    def __init__(self, field) -> None: ...
+    def __get__(self, instance, instance_type=None): ...
+
 class ObjectIdAccessor:
     field: Incomplete
     def __init__(self, field) -> None: ...
@@ -1733,6 +1746,45 @@ class CompositeKey(MetaField):
     column_name: Incomplete
     def bind(self, model, name, set_attribute: bool = True) -> None: ...
 
+class CompositeForeignKeyField(MetaField):
+    accessor_class: Incomplete
+    backref_accessor_class: Incomplete
+    object_id_name: Incomplete
+    rel_field: Incomplete
+    deferred: bool
+    rel_model: Incomplete
+    field_names: tuple[str, ...]
+    rel_field_names: tuple[str, ...] | None
+    declared_backref: Incomplete
+    backref: Incomplete
+    on_delete: Incomplete
+    on_update: Incomplete
+    deferrable: Incomplete
+    constraint_name: str | None
+    lazy_load: bool
+    local_fields: tuple[Incomplete, ...]
+    rel_fields: tuple[Incomplete, ...]
+    def __init__(
+        self,
+        model: type[Model] | Literal["self"],
+        fields: Iterable[str],
+        rel_fields: Iterable[str] | None = None,
+        backref: str | Callable[[Field[Any]], str] | None = None,
+        on_delete: str | None = None,
+        on_update: str | None = None,
+        deferrable: str | None = None,
+        constraint_name: str | None = None,
+        lazy_load: bool = True,
+    ) -> None: ...
+    def get_local_key(self, instance) -> tuple[Incomplete, ...]: ...
+    def get_rel_key(self, instance) -> tuple[Incomplete, ...]: ...
+    @staticmethod
+    def key_expression(fields, key) -> Expression: ...
+    def get_constraint_name(self) -> str: ...
+    def foreign_key_constraint(self, explicit_name: bool = False) -> NodeList: ...
+    def get_join_predicate(self, src, dest, is_backref, src_is_model, dest_is_model) -> Expression: ...
+    def bind(self, model, name, set_attribute: bool = True) -> None: ...
+
 class _SortedFieldList:
     __slots__ = ("_keys", "_items")
     def __init__(self) -> None: ...
@@ -2155,6 +2207,7 @@ __all__ = [
     "chunked",
     "Column",
     "CompositeKey",
+    "CompositeForeignKeyField",
     "Context",
     "Database",
     "DatabaseError",

@@ -4125,6 +4125,55 @@ Fields
       ``pragmas={'foreign_keys': 1}`` when you instantiate
       :class:`SqliteDatabase`.
 
+.. class:: CompositeForeignKeyField(model, fields, rel_fields=None, backref=None, on_delete=None, on_update=None, deferrable=None, constraint_name=None, lazy_load=True)
+
+   :param Model model: Model to reference, or the string ``'self'`` for a
+       self-referential relation.
+   :param fields: Names of the existing local fields that make up the
+       foreign key. No additional column is created; these fields store the
+       key values. They must be declared before the relation.
+   :param rel_fields: Names of the target fields on ``model``. Defaults to
+       the related model's composite primary key. The target fields must
+       together form the primary key or a unique index of the related model.
+   :param str backref: Accessor name for the back-reference, or "+" to
+       disable the back-reference accessor.
+   :param str on_delete: ON DELETE action, e.g. ``'CASCADE'``.
+   :param str on_update: ON UPDATE action.
+   :param str deferrable: Control when constraint is enforced.
+   :param str constraint_name: Explicit name for the foreign-key constraint.
+   :param bool lazy_load: Fetch the related object when the relation
+       attribute is accessed (if it was not already loaded). If disabled,
+       accessing the relation returns the key tuple instead.
+
+   Declares a composite foreign-key relationship over existing local fields.
+   A multi-column ``FOREIGN KEY`` constraint is emitted when the table is
+   created. The relation supports lazy loading, assignment of a saved
+   related instance, back-references, automatic joins, :py:func:`prefetch`
+   and :py:meth:`ModelSelect.with_related`.
+
+   .. code-block:: python
+
+      class Document(BaseModel):
+          tenant_id = IntegerField()
+          document_no = CharField()
+
+          class Meta:
+              primary_key = CompositeKey('tenant_id', 'document_no')
+
+      class LineItem(BaseModel):
+          tenant_id = IntegerField(null=True)
+          document_no = CharField(null=True)
+          document = CompositeForeignKeyField(
+              Document, fields=('tenant_id', 'document_no'), backref='lines')
+
+   Null semantics: the key is treated as a single unit. When *every*
+   component is ``None`` the relation is empty; a *partially* null key raises
+   :py:class:`ValueError` on access or assignment rather than issuing a
+   lenient query. Modifying any component field invalidates the cached
+   related object.
+
+   See :ref:`composite-foreign-keys` for a full discussion and examples.
+
 .. class:: DeferredForeignKey(rel_model_name, **kwargs)
 
    :param str rel_model_name: Model name to reference.
